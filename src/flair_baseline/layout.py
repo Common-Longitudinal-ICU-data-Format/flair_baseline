@@ -81,6 +81,11 @@ class TaskPaths:
     def preds(self) -> Path:
         return self.phi_root / "preds.parquet"
 
+    @property
+    def features(self) -> Path:
+        """Cached count-join output (sidecar features_meta.json sits beside it)."""
+        return self.phi_root / "features.npz"
+
     # --- non-PHI (uploaded) ------------------------------------------------
     @property
     def codes(self) -> Path:
@@ -102,6 +107,11 @@ class TaskPaths:
     @property
     def vocab(self) -> Path:
         return self.models_root / "vocab.json"
+
+    @property
+    def params(self) -> Path:
+        """Best XGBoost hyperparameters from HPO (informational + shippable)."""
+        return self.models_root / "params.json"
 
     def mkdirs(self) -> None:
         """Create every parent directory this task writes into."""

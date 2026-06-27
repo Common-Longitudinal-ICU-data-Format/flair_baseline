@@ -31,6 +31,10 @@ site against a saved model). A saved vocab is in the same truncated space.
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -76,15 +80,30 @@ def truncated_code_map(ev: pl.LazyFrame) -> pl.DataFrame:
     return code_meta.join(trunc_ids, on="trunc").select("code", "trunc", "cint")
 
 
-def count_features(events, task_df: pl.DataFrame, label_col: str,
-                   vocab: list[str] | None = None, n_chunks: int = 8
-                   ) -> tuple[sp.csr_matrix, list[str], list[str]]:
-    """Return (X_csr, prediction_ids, vocab). Row order = prediction_ids.
+@dataclass
+class Counts:
+    """The vocab-independent output of the point-in-time count join.
 
-    The vocabulary is every code in the MEDS table (fit on the train split, or
-    supplied via ``vocab=``). Extraction is the single source of truth: whatever the
-    ELF config extracted into MEDS is exactly what can be featured — there is no
-    feature-time exclusion. To drop a domain, remove it from flair_elf_config.yaml.
+    ``(rr, cc, nn)`` are the COO triplets over the *truncated-code* space
+    (``cc`` indexes ``trunc_by_cint``); ``split`` is per-row so vocab can be
+    fit on the train split at ``counts_to_X`` time. This is the expensive part
+    to compute, so it is what gets cached to disk (see ``save_counts``).
+    """
+    rr: np.ndarray            # row index (prediction row r)
+    cc: np.ndarray            # truncated-code id (cint)
+    nn: np.ndarray            # count (float32)
+    trunc_by_cint: list[str]  # cint → truncated code name
+    prediction_ids: list[str]  # row order
+    split: np.ndarray         # per-row split label ("train"/"test")
+    n_rows: int
+
+
+def compute_counts(events, task_df: pl.DataFrame, n_chunks: int = 8) -> Counts:
+    """Run the heavy, vocab-independent point-in-time count join → ``Counts``.
+
+    This is everything up to (but not including) vocabulary resolution, so the
+    result is reusable for both training (vocab fit on train) and inference
+    (vocab supplied) over the same cohort. Cache it with ``save_counts``.
     """
     ev = events if isinstance(events, pl.LazyFrame) else events.lazy()
 
@@ -94,6 +113,7 @@ def count_features(events, task_df: pl.DataFrame, label_col: str,
         .with_row_index("r")
     )
     prediction_ids = preds["prediction_id"].to_list()
+    split = preds["split"].to_numpy()
     n_rows = preds.height
 
     # Factorize blocks (+ a hash chunk) and codes to int32 so the join stays lean.
@@ -109,7 +129,6 @@ def count_features(events, task_df: pl.DataFrame, label_col: str,
     trunc_by_cint = (
         code_map.select("cint", "trunc").unique().sort("cint")["trunc"].to_list()
     )
-    n_codes = len(trunc_by_cint)
     raw_to_cint = code_map.select("code", "cint")           # raw code → feature id
 
     ev_int = (
@@ -148,12 +167,28 @@ def count_features(events, task_df: pl.DataFrame, label_col: str,
     del r_parts, c_parts, n_parts
     gc.collect()
 
+    return Counts(rr=rr, cc=cc, nn=nn, trunc_by_cint=trunc_by_cint,
+                  prediction_ids=prediction_ids, split=split, n_rows=n_rows)
+
+
+def counts_to_X(counts: Counts, vocab: list[str] | None = None
+                ) -> tuple[sp.csr_matrix, list[str], list[str]]:
+    """Resolve vocabulary and build the CSR matrix from cached ``Counts``.
+
+    ``vocab=None`` fits the vocabulary on the train split (the default for
+    training); otherwise the supplied vocab is used (scoring a new site against
+    a saved model). Cheap relative to ``compute_counts``.
+    """
+    rr, cc, nn = counts.rr, counts.cc, counts.nn
+    trunc_by_cint = counts.trunc_by_cint
+    prediction_ids = counts.prediction_ids
+    n_rows = counts.n_rows
+    n_codes = len(trunc_by_cint)
+
     # Resolve vocabulary → a cint → column-index lookup array. Vocab entries are
     # truncated codes, aligned to the cint factorization above.
     if vocab is None:
-        train_r = preds.filter(pl.col("split") == "train")["r"].to_numpy()
-        is_train = np.zeros(n_rows, dtype=bool)
-        is_train[train_r] = True
+        is_train = counts.split == "train"
         train_cints = np.unique(cc[is_train[rr]]) if rr.size else np.empty(0, "int64")
         order = sorted(train_cints.tolist(), key=lambda ci: trunc_by_cint[ci])
         vocab = [trunc_by_cint[ci] for ci in order]
@@ -178,3 +213,84 @@ def count_features(events, task_df: pl.DataFrame, label_col: str,
         shape=(n_rows, len(vocab)), dtype="float32",
     )
     return X, prediction_ids, vocab
+
+
+def _ids_hash(prediction_ids: list[str]) -> str:
+    """Stable fingerprint of the cohort's prediction_ids (order-sensitive)."""
+    h = hashlib.sha1()
+    for pid in prediction_ids:
+        h.update(str(pid).encode())
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _meta_path(path: str | Path) -> Path:
+    return Path(path).with_name("features_meta.json")
+
+
+def save_counts(path: str | Path, counts: Counts) -> None:
+    """Persist ``Counts`` to ``features.npz`` + a ``features_meta.json`` sidecar.
+
+    The npz holds the binary arrays (triplets + prediction_ids + split); the
+    JSON sidecar holds ``trunc_by_cint`` and a cohort fingerprint (id hash +
+    n_rows) so ``load_counts`` can cheaply validate before reading the npz.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        rr=counts.rr, cc=counts.cc, nn=counts.nn,
+        prediction_ids=np.asarray(counts.prediction_ids, dtype=object).astype("U"),
+        split=counts.split.astype("U"),
+    )
+    # np.savez appends .npz if missing — normalize so the meta sidecar sits beside it.
+    saved = path if path.suffix == ".npz" else path.with_suffix(".npz")
+    _meta_path(saved).write_text(json.dumps({
+        "trunc_by_cint": counts.trunc_by_cint,
+        "n_rows": counts.n_rows,
+        "ids_hash": _ids_hash(counts.prediction_ids),
+    }))
+
+
+def load_counts(path: str | Path, task_df: pl.DataFrame) -> Counts | None:
+    """Load cached ``Counts`` iff it matches ``task_df``'s cohort, else ``None``.
+
+    Validation compares the sidecar's ``n_rows`` + prediction-id hash against
+    the current cohort, so a stale cache (different/resplit cohort, e.g. the
+    train run's full cohort vs an infer holdout) is rejected and recomputed.
+    """
+    path = Path(path)
+    saved = path if path.suffix == ".npz" else path.with_suffix(".npz")
+    meta_p = _meta_path(saved)
+    if not (saved.exists() and meta_p.exists()):
+        return None
+    meta = json.loads(meta_p.read_text())
+    cohort_ids = task_df["prediction_id"].to_list()
+    if meta.get("n_rows") != len(cohort_ids):
+        return None
+    if meta.get("ids_hash") != _ids_hash(cohort_ids):
+        return None
+    with np.load(saved, allow_pickle=False) as z:
+        return Counts(
+            rr=z["rr"], cc=z["cc"], nn=z["nn"],
+            trunc_by_cint=list(meta["trunc_by_cint"]),
+            prediction_ids=z["prediction_ids"].tolist(),
+            split=z["split"].astype(object).astype(str),
+            n_rows=int(meta["n_rows"]),
+        )
+
+
+def count_features(events, task_df: pl.DataFrame, label_col: str,
+                   vocab: list[str] | None = None, n_chunks: int = 8
+                   ) -> tuple[sp.csr_matrix, list[str], list[str]]:
+    """Return (X_csr, prediction_ids, vocab). Row order = prediction_ids.
+
+    Thin wrapper: ``compute_counts`` (heavy join) then ``counts_to_X`` (vocab +
+    CSR). Kept for backward compatibility; the CLI splits the two so the join
+    output can be cached. The vocabulary is fit on the train split, or supplied
+    via ``vocab=``. Extraction is the single source of truth: whatever the ELF
+    config extracted into MEDS is exactly what can be featured — to drop a
+    domain, remove it from flair_elf_config.yaml.
+    """
+    counts = compute_counts(events, task_df, n_chunks=n_chunks)
+    return counts_to_X(counts, vocab=vocab)

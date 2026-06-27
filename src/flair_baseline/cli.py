@@ -24,7 +24,8 @@ import polars as pl
 import typer
 
 from flair_baseline.config import DEFAULT_ELF_CONFIG, resolve_task
-from flair_baseline.featurize import count_features
+from flair_baseline.featurize import (compute_counts, counts_to_X, load_counts,
+                                      save_counts)
 from flair_baseline.layout import TaskPaths, report_mode
 from flair_baseline.train import train_and_score
 
@@ -88,14 +89,16 @@ def _stitch(clif_config: str):
 def _pipeline(task_name: str, clif_config: str, elf_config: str, paths: TaskPaths,
               *, train_end: Optional[str] = None, test_start: Optional[str] = None,
               model_in: Optional[str] = None, vocab_list: Optional[list] = None,
-              force_holdout: bool = False, report: bool = True,
-              viz: bool = False, reuse: bool = False) -> None:
+              report: bool = True,
+              viz: bool = True, reuse: bool = False, n_trials: int = 30) -> None:
     """Cohort → Table 1 → MEDS/codes → featurize → train|score → report.
 
-    Writes land in the three site-prefixed folders via `paths`. When `model_in`
-    is set the model is scored (external validation) instead of fit; when
-    `force_holdout` is set the cohort is re-split 75/25 at the block grain so the
-    reported 'test' split is a deterministic 25% of the site's data.
+    Writes land in the three site-prefixed folders via `paths`. The task builder
+    always emits a train+test cohort (mimic→random 75/25, external→temporal, or a
+    date split when train_end/test_start are given), so cohort.parquet + Table 1
+    always carry both splits — train and inference alike. When `model_in` is set
+    the shipped model is scored on the held-out test split only (external
+    validation, no fit); training uses the whole cohort.
     """
     import json
 
@@ -109,59 +112,71 @@ def _pipeline(task_name: str, clif_config: str, elf_config: str, paths: TaskPath
 
     if reuse and paths.cohort.exists() and paths.meds.exists():
         typer.echo(f"[{task_name}] reusing existing cohort + MEDS table")
-        cohort = pl.read_parquet(paths.cohort)
+        cohort_full = pl.read_parquet(paths.cohort)
     else:
-        from flair_benchmark._table1 import generate_table1
         typer.echo(f"[{task_name}] building cohort …")
-        cohort = task_module.build(clif_config=clif_config,
-                                   train_end=train_end, test_start=test_start)
-        if force_holdout:
-            # External site: drop the all-'test' split and force the same
-            # deterministic 75/25 block-grain split MIMIC uses, so the reported
-            # 'test' set is 25% of this site's data (ordered by prediction_dttm,
-            # which the cohort always carries; join_id is the block grain).
-            from flair_benchmark._split import assign_split
-            cohort = assign_split(cohort.drop("split"), site="mimic",
-                                  train_end=None, test_start=None,
-                                  admission_col="prediction_dttm")
-            # Inference scores only the deterministic 25% holdout — drop train now
-            # (split is fixed) so MEDS extraction, codes/Table1, the count join and
-            # scoring all run on test ids only. The holdout is unchanged: the full
-            # cohort was built and split before this filter.
-            cohort = cohort.filter(pl.col("split") == "test")
-        cohort.write_parquet(paths.cohort)
+        # The task builder assigns the train/test split per site, so the cohort
+        # always carries both splits — written in full for train and infer alike.
+        cohort_full = task_module.build(clif_config=clif_config,
+                                        train_end=train_end, test_start=test_start)
+        cohort_full.write_parquet(paths.cohort)
 
-        table1 = generate_table1(read_clif_config(clif_config), cohort, task_module)
-        paths.table1.write_text(json.dumps(table1, indent=2, default=str))
-        typer.echo(f"[{task_name}] Table 1 → {paths.table1}")
-
+        # Inference scores the held-out test split only → MEDS/codes/features/preds
+        # stay test-only (PHI + compute minimised); training uses the whole cohort.
+        meds_cohort = (cohort_full.filter(pl.col("split") == "test")
+                       if model_in else cohort_full)
         typer.echo(f"[{task_name}] FE-meds …")
         # MEDS (PHI) + codes (non-PHI) are written under one dir by the lib;
         # write into the PHI root, then relocate codes.parquet to the upload folder.
-        build_meds_tables(cohort, read_clif_config(clif_config), elf_config,
+        build_meds_tables(meds_cohort, read_clif_config(clif_config), elf_config,
                           str(paths.phi_root))
         _relocate(paths.phi_root / "metadata" / "codes.parquet", paths.codes)
 
-    n_train = cohort.filter(pl.col("split") == "train").height
-    n_test = cohort.filter(pl.col("split") == "test").height
-    typer.echo(f"[{task_name}] cohort: {cohort.height:,} rows "
-               f"({n_train:,} train / {n_test:,} test)")
+    # Table 1 (total/train/test) is always generated at task-build time from the FULL
+    # cohort — never deferred to the report — so every site (incl. inference-only) ships
+    # a train/test/total table.
+    from flair_benchmark._table1 import generate_table1
+    table1 = generate_table1(read_clif_config(clif_config), cohort_full, task_module)
+    paths.table1.write_text(json.dumps(table1, indent=2, default=str))
+    typer.echo(f"[{task_name}] Table 1 (total/train/test) → {paths.table1}")
+
+    # Scored rows: test-only on inference, the whole cohort on training. The cohort and
+    # Table 1 above always cover train+test regardless.
+    score_cohort = (cohort_full.filter(pl.col("split") == "test")
+                    if model_in else cohort_full)
+    n_train = cohort_full.filter(pl.col("split") == "train").height
+    n_test = cohort_full.filter(pl.col("split") == "test").height
+    typer.echo(f"[{task_name}] cohort: {cohort_full.height:,} rows "
+               f"({n_train:,} train / {n_test:,} test) — scoring {score_cohort.height:,}")
 
     typer.echo(f"[{task_name}] count featurization …")
     events_lf = pl.scan_parquet(paths.meds)
+    # The count join is the expensive, vocab-independent step → cache it in the
+    # PHI folder. With --reuse, load it back (validated against this cohort);
+    # otherwise compute and save. Vocab resolution + CSR build is cheap.
+    counts = None
+    if reuse and paths.features.exists():
+        counts = load_counts(paths.features, score_cohort)
+        if counts is not None:
+            typer.echo(f"[{task_name}] reusing cached features → {paths.features}")
+    if counts is None:
+        counts = compute_counts(events_lf, score_cohort)
+        save_counts(paths.features, counts)
     if model_in:
-        X, ids, _ = count_features(events_lf, cohort, label_col, vocab=vocab_list)
+        X, ids, _ = counts_to_X(counts, vocab=vocab_list)
         typer.echo(f"[{task_name}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} "
                    f"({X.nnz:,} nnz)")
         typer.echo(f"[{task_name}] scoring with shipped model …")
-        preds = train_and_score(X, ids, vocab_list, cohort, label_col, model_in=model_in)
+        preds = train_and_score(X, ids, vocab_list, score_cohort, label_col, model_in=model_in)
     else:
-        X, ids, vocab = count_features(events_lf, cohort, label_col)
+        X, ids, vocab = counts_to_X(counts)
         typer.echo(f"[{task_name}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} "
                    f"({X.nnz:,} nnz)")
-        typer.echo(f"[{task_name}] training XGBoost …")
-        preds = train_and_score(X, ids, vocab, cohort, label_col,
-                                model_out=str(paths.model), vocab_out=str(paths.vocab))
+        typer.echo(f"[{task_name}] training XGBoost "
+                   f"({f'HPO {n_trials} trials' if n_trials else 'fixed params'}) …")
+        preds = train_and_score(X, ids, vocab, score_cohort, label_col,
+                                model_out=str(paths.model), vocab_out=str(paths.vocab),
+                                params_out=str(paths.params), n_trials=n_trials)
     preds.write_parquet(paths.preds)
 
     auc_tr, auc_te = _auroc(preds, label_col, "train"), _auroc(preds, label_col, "test")
@@ -195,20 +210,25 @@ def train_cmd(
     train_end: Optional[str] = typer.Option(None, "--train-end"),
     test_start: Optional[str] = typer.Option(None, "--test-start"),
     report: bool = typer.Option(True, "--report/--no-report", help="Also build the report bundle"),
-    viz: bool = typer.Option(False, "--viz/--no-viz", help="Render sanity-check PNGs"),
+    viz: bool = typer.Option(True, "--viz/--no-viz", help="Render sanity-check PNGs"),
     reuse: bool = typer.Option(False, "--reuse/--no-reuse",
-                               help="Reuse existing cohort.parquet + MEDS.parquet when present"),
+                               help="Reuse cohort.parquet + MEDS.parquet + cached features when present"),
+    hpo: bool = typer.Option(True, "--hpo/--no-hpo",
+                             help="Optuna hyperparameter search (best params → <site>_baseline_models/params.json)"),
+    hpo_trials: int = typer.Option(30, "--hpo-trials", help="Optuna trials when --hpo"),
 ) -> None:
     """Train the baseline on the configured site; models land in <site>_baseline_models/."""
     from flair_benchmark.tasks import list_tasks
 
     cfg = _stitch(clif_config)
     site = cfg.get("site")
+    n_trials = hpo_trials if hpo else 0
     tasks = [resolve_task(task)] if task else list_tasks()
     for t in tasks:
         paths = TaskPaths.make(out, site, t)
         _pipeline(t, clif_config, elf_config, paths, train_end=train_end,
-                  test_start=test_start, report=report, viz=viz, reuse=reuse)
+                  test_start=test_start, report=report, viz=viz, reuse=reuse,
+                  n_trials=n_trials)
 
 
 @app.command("infer")
@@ -221,7 +241,7 @@ def infer_cmd(
     out: str = typer.Option(".", "--out", help="Root dir for the three site-prefixed folders"),
     task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = all 5"),
     report: bool = typer.Option(True, "--report/--no-report"),
-    viz: bool = typer.Option(False, "--viz/--no-viz"),
+    viz: bool = typer.Option(True, "--viz/--no-viz"),
 ) -> None:
     """Score a shipped model on this site's data; report on a deterministic 25% test split."""
     import json
@@ -241,7 +261,7 @@ def infer_cmd(
         vocab_list = json.loads(vocab_path.read_text())["vocab"]
         paths = TaskPaths.make(out, site, t)
         _pipeline(t, clif_config, elf_config, paths, model_in=str(model_path),
-                  vocab_list=vocab_list, force_holdout=True, report=report, viz=viz)
+                  vocab_list=vocab_list, report=report, viz=viz)
 
 
 def main() -> None:

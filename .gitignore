@@ -10,6 +10,8 @@
 out/
 out_external/
 output/
+logs/
+*.log
 
 # real site configs — only the .template.json is tracked
 clif_config*.json
