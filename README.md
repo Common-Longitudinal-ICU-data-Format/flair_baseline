@@ -6,7 +6,12 @@ A **self-contained sub-project**: it carries its own config and pins the FLAIR l
 
 ## What it does
 
-For each task: 1. `task.build()` → cohort (one row per `prediction_id`, with `split`). On MIMIC the split is **75/25 on `hospitalization_join_id`** (an encounter never spans train and test). At an external site `infer` re-applies the same deterministic 75/25 block split, so the model is evaluated on a **25% holdout** of that site's data. 2. **FE-meds** (`flair_benchmark.features.fe_meds`) runs the vendored CLIF→MEDS ETL over the cohort and writes `MEDS.parquet` (events) + `codes.parquet` (code registry, counts floored to the suppression threshold). 3. **Count featurizer** — counts each ELF code with `time < prediction_dttm` (strict point-in-time, no leakage). Vocabulary is fit on the train split only. 4. **XGBoost** fits on train (or loads a shipped model), scores all rows → `preds.parquet`. 5. **FLAIR report** bundle, scored by the per-task mode below.
+The pipeline is **staged** — run the subcommands in sequence (the CLIF→MEDS ETL is built **once**, not per task):
+
+1. **`build-cohorts`** → each task's cohort (one row per `prediction_id`, with `split`), always carrying both train+test. On MIMIC the split is **75/25 on `hospitalization_join_id`** (an encounter never spans train and test); at an external site the same deterministic 75/25 block split is re-applied, so the model is evaluated on a **25% holdout** of that site's data. Also writes `table1.json`.
+2. **`build-data`** runs the vendored CLIF→MEDS ETL **once** over the **union of all task cohorts** — each `hospitalization_join_id` expanded to its full **stitched membership** (sibling hospitalizations included, so no encounter event is dropped) — into one shared `_shared/MEDS/` store.
+3. **`featurize`** — per task, counts each ELF code with `time < prediction_dttm` (strict point-in-time, no leakage) off the shared store, and derives that task's `codes.parquet` (code registry, counts floored to the suppression threshold). The feature **vocabulary is a fixed, committed `vocab.json`** shared by every task and site (not fit per task) — so every model has the same columns and bundles are interchangeable.
+4. **`train`** fits XGBoost per task on the fixed vocab; **`infer`** loads a shipped model instead. Both score all rows → `preds.parquet` + a **FLAIR report** bundle, scored by the per-task mode below.
 
 ### Report bundle (per task)
 
@@ -27,7 +32,8 @@ Feature domains (`flair_elf_config.yaml`): all vitals, all labs, respiratory sup
 Every run writes under one `--out` root (default `.`), into three folders prefixed with the `site` from your config. Only the **non-PHI** folder is meant to leave the site.
 
 ```         
-<site>_baseline_phi/<task>/                  cohort.parquet, data/MEDS.parquet, preds.parquet   ← stays local (PHI)
+<site>_baseline_phi/_shared/MEDS/            shared CLIF→MEDS events (built once, all tasks)   ← stays local (PHI)
+<site>_baseline_phi/<task>/                  cohort.parquet, features.npz, preds.parquet      ← stays local (PHI)
 <site>_baseline_non_phi_for_upload/<task>/   codes.parquet, table1.json, report/*.json, report/viz/*.png   ← upload this
 <site>_baseline_models/<task>/               model.json, vocab.json                            ← ship to other sites
 ```
@@ -53,6 +59,10 @@ cp config/clif_config.template.json config/clif_config.json
 # edit config/clif_config.json: set "site" (prefixes every output folder) and "data_directory"
 ```
 
+The fixed feature vocabulary `vocab.json` ships committed in this repo — both `train` and
+`infer` load it, so every model and every site share one column space. Maintainers
+regenerate it with `build-vocab` (see below); sites never touch it.
+
 For both train and inference sites, the FLAIR library ships **prebuilt** as `wheels/flair_benchmark-*.whl` (committed in this repo), so there is nothing to clone or symlink — `uv sync` installs it from there. This is the interim mechanism until `flair-benchmark` is published on PyPI, at which point the `[tool.uv.sources]` wheel pin drops and `uv sync` resolves it from the index.
 
 > **Updating the bundled library** (maintainers only): rebuild the wheel from the FLAIR repo, then re-sync.
@@ -73,15 +83,27 @@ For both train and inference sites, the FLAIR library ships **prebuilt** as `whe
 
 1.  Set `"site": "mimic"` and the MIMIC `data_directory` in `config/clif_config.json`.
 
-2.  Train all 5 tasks:
+2.  Run the staged pipeline, then train all 5 tasks:
 
     ``` bash
-    uv run flair-baseline train --clif-config config/clif_config.json --out . --viz
+    uv run flair-baseline build-cohorts --clif-config config/clif_config.json --out .
+    uv run flair-baseline build-data    --clif-config config/clif_config.json --out .   # ETL once
+    uv run flair-baseline featurize     --clif-config config/clif_config.json --out .
+    uv run flair-baseline train         --clif-config config/clif_config.json --out . --viz
+    # or, the first three in one go:  uv run flair-baseline prepare --clif-config … --out .
     ```
 
-3.  Three folders appear: `mimic_baseline_phi/` (local), `mimic_baseline_non_phi_for_upload/` (MIMIC's own results), and **`mimic_baseline_models/`** — the per-task `model.json` + `vocab.json`.
+    > **Low-memory box?** add the hidden `--pmc --batch-size N` to `build-data` (poor-man's-compute):
+    > it extracts the shared MEDS in sequential N-encounter batches to part-files, so peak RAM
+    > is one batch instead of the whole cohort. Output is identical, just slower.
+
+3.  Three folders appear: `mimic_baseline_phi/` (local, incl. the shared `_shared/MEDS/`), `mimic_baseline_non_phi_for_upload/` (MIMIC's own results), and **`mimic_baseline_models/`** — the per-task `model.json` + `vocab.json`.
 
 4.  **Publish `mimic_baseline_models/`** to the FLAIR website as the downloadable model bundle. That folder is all a CLIF site needs.
+
+> **Regenerating the fixed vocabulary** (maintainers, rarely): after `build-data`, run
+> `uv run flair-baseline build-vocab --clif-config config/clif_config.json --out .` → writes
+> `vocab.json`; commit it. All tasks/sites then share that feature space.
 
 ------------------------------------------------------------------------
 
@@ -91,27 +113,36 @@ For both train and inference sites, the FLAIR library ships **prebuilt** as `whe
 
 2.  **Download the models folder** from the FLAIR website and drop it into the baseline folder, e.g. `flair_baseline/mimic_baseline_models/` (unzip here; keep the per-task subfolders).
 
-3.  Run inference — scores the downloaded models on a deterministic 25% holdout of your data:
+3.  Run inference — same staged commands, but scope the data pull to your **25% holdout**
+    with `--holdout-only` (only those encounters' join ids are ETL'd / featurized):
 
     ``` bash
-    uv run flair-baseline infer \
-      --models-dir mimic_baseline_models \
-      --clif-config config/clif_config.json \
-      --out . --viz
-    # one task only: add --task task1
+    uv run flair-baseline build-cohorts --clif-config config/clif_config.json --out .
+    uv run flair-baseline build-data    --clif-config config/clif_config.json --out . --holdout-only
+    uv run flair-baseline featurize     --clif-config config/clif_config.json --out . --holdout-only
+    uv run flair-baseline infer --models-dir mimic_baseline_models \
+      --clif-config config/clif_config.json --out . --viz
+    # one task only: add --task task1 to each command
     ```
+
+    Your cohort is still built in full (train+test, so Table 1 ships complete) — only the
+    ETL + featurization are restricted to the test-split encounters, saving compute.
 
 4.  Three folders appear, prefixed with **your** site name:
 
-    - `rush_baseline_phi/` — cohort, MEDS, preds → **stays on your machine** (PHI, never upload).
+    - `rush_baseline_phi/` — cohort, shared `_shared/MEDS/`, features, preds → **stays on your machine** (PHI, never upload).
     - `rush_baseline_models/` — the models you ran (already public).
     - **`rush_baseline_non_phi_for_upload/`** — codes registry, Table 1, report JSONs + PNGs.
 
 5.  **Upload only `rush_baseline_non_phi_for_upload/`** to the FLAIR website (or the provided secure Box link). Nothing else leaves your site.
 
-> Quick check before upload: the folder holds only `codes.parquet`, `table1.json`, and `report/` — no `cohort.parquet`, `MEDS.parquet`, or `preds.parquet`. All cell counts \< 10 are already suppressed (`"<10"`).
+> Quick check before upload: the folder holds only `codes.parquet`, `table1.json`, and `report/` — no `cohort.parquet`, `_shared/MEDS/`, `features.npz`, or `preds.parquet`. All cell counts \< 10 are already suppressed (`"<10"`).
 
 ## Results (MIMIC-IV, 75/25 join-id split)
+
+> Note: the table below predates the shared-MEDS rebuild. Pulling every stitched
+> **sibling** hospitalization (previously dropped) adds events, so counts and AUROCs
+> shift slightly upward on retrain — regenerate the table after a fresh `train`.
 
 **Report AUROC** is the headline metric in `discrimination.json` — the one that gets uploaded. It is mode-matched (episodic = one row/stay; peak = stay-peak risk; landmark = the lead-0 landmark, i.e. each stay's last window). The **row-level** column is the raw per-prediction-row AUROC for context — for peak/landmark tasks it differs because a stay contributes many correlated rows, so it is not the deployed metric.
 
@@ -128,4 +159,5 @@ For both train and inference sites, the FLAIR library ships **prebuilt** as `whe
 ## Scale notes
 
 - The featurizer factorizes codes + encounter blocks to int32 and runs the event→prediction join in `n_chunks` block-hash partitions (default 8), so peak memory is \~1/n_chunks of the aggregation. This keeps even task4 — **14.3M hourly predictions, \~95M events, \~930M feature non-zeros** — within a 16 GB machine (peak ≈ 12 GB, \~21 min featurize + \~5 min train). Features are sparse CSR throughout.
-- ETL loads full CLIF tables per task (\~few min each); FE-meds writes `MEDS.parquet` once per task and the featurizer scans it lazily.
+- `build-data` runs the CLIF→MEDS ETL **once** over the union of all 5 task cohorts (each encounter expanded to its full stitched membership) → `_shared/MEDS/`. Since the tasks overlap heavily on `hospitalization_join_id`, this replaces up to 5× redundant per-task extraction. `featurize` scans the shared store lazily, restricting to each task's encounters via the inner join.
+- The hidden `-pmc` (poor-man's-compute) mode on `build-data` (`--pmc --batch-size N`) extracts the shared MEDS in sequential N-encounter batches to `part-NNNN.parquet` files, bounding peak RAM to one batch — identical output, slower. Without it, a single `part-0000.parquet` is written.

@@ -44,6 +44,54 @@ def slug(site: str | None) -> str:
 
 
 @dataclass(frozen=True)
+class SitePaths:
+    """Site-level (task-independent) artifacts: the ONE shared MEDS store.
+
+    The CLIF→MEDS ETL is built once over the union of all task cohorts and lives
+    here, under the PHI root, so every task featurizes off the same events instead
+    of re-extracting. ``MEDS/`` holds one or more ``part-NNNN.parquet`` files
+    (a single part for a normal run; several for the batched ``-pmc`` mode), all
+    scanned together via the ``meds_glob``.
+    """
+
+    out_root: Path
+    site: str
+
+    @classmethod
+    def make(cls, out_root: str | Path, site: str) -> "SitePaths":
+        return cls(Path(out_root), slug(site))
+
+    @property
+    def shared_root(self) -> Path:
+        return self.out_root / f"{self.site}_baseline_phi" / "_shared"
+
+    @property
+    def meds_dir(self) -> Path:
+        return self.shared_root / "MEDS"
+
+    @property
+    def meds_glob(self) -> str:
+        """Glob passed to ``pl.scan_parquet`` — covers single- and multi-part stores."""
+        return str(self.meds_dir / "part-*.parquet")
+
+    @property
+    def versions(self) -> Path:
+        """Per-domain ELF versions captured at build-data time (for the codes registry)."""
+        return self.shared_root / "domain_versions.json"
+
+    @property
+    def manifest(self) -> Path:
+        """Reuse key for build-data: scope + join-id-set hash + elf hash + batch info."""
+        return self.shared_root / "manifest.json"
+
+    def has_meds(self) -> bool:
+        return self.meds_dir.exists() and any(self.meds_dir.glob("part-*.parquet"))
+
+    def mkdirs(self) -> None:
+        self.meds_dir.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass(frozen=True)
 class TaskPaths:
     """Absolute paths for one task's artifacts across the three folders."""
 
