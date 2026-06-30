@@ -49,6 +49,33 @@ Model folders keep their **training-site** prefix; PHI + non-PHI folders carry t
 
 Only two things ever move: the **models folder** (owner → site) and the **non-PHI results folder** (site → FLAIR). Patient data never leaves a site.
 
+### All commands at a glance
+
+After the shared setup below, the full sequence per role:
+
+``` bash
+# ── Model owner (trains on MIMIC) ──────────────────────────────────────────────
+# config: "site": "mimic", MIMIC data_directory
+uv run flair-baseline build-cohorts --clif-config config/clif_config.json --out .   # 5 cohorts + table1
+uv run flair-baseline build-data    --clif-config config/clif_config.json --out .   # ONE shared MEDS (ETL once)
+uv run flair-baseline build-vocab   --clif-config config/clif_config.json --out .   # regen vocab.json (commit it)
+uv run flair-baseline featurize     --clif-config config/clif_config.json --out .   # per-task features + codes
+uv run flair-baseline train         --clif-config config/clif_config.json --out . --viz   # fit 5 models (+ --no-hpo to skip HPO)
+# → publish mimic_baseline_models/  (build-vocab is owner-only; sites use the committed vocab.json)
+
+# ── CLIF site (infers on local data) ───────────────────────────────────────────
+# config: "site": "<yoursite>", your data_directory; drop the model bundle into ./mimic_baseline_models/
+uv run flair-baseline build-cohorts --clif-config config/clif_config.json --out .
+uv run flair-baseline build-data    --clif-config config/clif_config.json --out . --holdout-only   # test-split joins only
+uv run flair-baseline featurize     --clif-config config/clif_config.json --out . --holdout-only
+uv run flair-baseline infer --models-dir mimic_baseline_models \
+  --clif-config config/clif_config.json --out . --viz
+# → upload only <yoursite>_baseline_non_phi_for_upload/
+```
+
+Shortcuts: `prepare` runs `build-cohorts → build-data → featurize` in one call (add `--holdout-only` for a site).
+Add `--task task1` to any command to run a single task. Low-RAM box: add `--pmc --batch-size N` to `build-data`.
+
 ### Shared setup (both roles, once)
 
 ``` bash
