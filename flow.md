@@ -113,7 +113,7 @@ ELF code format (`//` separates hierarchy levels):
 ```         
 VITAL//heart_rate                         LAB//lactate//mmol/l//bmp
 MED_CON//norepinephrine//mcg/kg/min//start    MED_INT//vancomycin//mg//given
-RESP//device_category//imv   PA//gcs_total   PA//rass   CRRT//crrt_mode_category//cvvhdf
+RESP//device_category//imv   PA//gcs_total   PA//rass
 HOSP_DX//ICD10CM//A41.9
 ```
 
@@ -212,7 +212,6 @@ lead-time) and add `leadtime.json`. Peak task (4) omits `calibration.json`/`dca.
 | LAB | all labs | ✅ |
 | RESP | respiratory-support settings | ✅ |
 | PA | patient assessments — **GCS + RASS only** | ✅ |
-| CRRT | CRRT presence (count \> 0 ⇒ on CRRT) | ✅ |
 | MED_CON | continuous meds (vasopressors, sedatives, …) | ✅ |
 | MED_INT | intermittent meds (antibiotics, …) | ✅ |
 | HOSP_DX | hospital discharge diagnoses | ❌ extracted, **excluded** (post-hoc/leaky) |
@@ -235,7 +234,7 @@ lead-time) and add `leadtime.json`. Peak task (4) omits `calibration.json`/`dca.
 
 - `label_mortality` · outcome · one-per-window (daily 07:00 grid) · threshold 0.95.
 - Cohort **198,125** rows (148,763 train / 49,362 test; 9,838 test positives).
-- MEDS **94,137,739** events / 17,404 codes. Per-domain: VITAL 44.999M, LAB 17.584M, RESP 11.726M, PA 8.282M, MED_CON 6.224M, MED_INT 2.681M, CRRT 1.468M, HOSP_DX 1.174M.
+- MEDS events / codes per-domain: VITAL 44.999M, LAB 17.584M, RESP 11.726M, PA 8.282M, MED_CON 6.224M, MED_INT 2.681M, HOSP_DX 1.174M.
 - Features **198,125 × 433**, 14.66M nnz. **Test AUROC 0.790**. 9 PNGs (+ encounter lead_time / operating_curve). Encounter: 16,102 stays (2,135 event); at t=0.95 stay-sens 0.017, ctrl-alarm 0.001, NNA 3.58 — lead ≈0 (daily mortality label fires on the event day).
 
 ### task2 — ICU Daily LTACH Discharge (7 AM)

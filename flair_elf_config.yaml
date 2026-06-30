@@ -21,6 +21,5 @@ domains:
   PA:                  # patient assessments — GCS + RASS only
     category_col: assessment_category
     categories: [gcs_total, gcs_eye, gcs_verbal, gcs_motor, rass]
-  CRRT: {}             # CRRT — presence (count > 0 ⇒ on CRRT)
   MED_CON: {}          # continuous medications (vasopressors, sedatives, …)
   MED_INT: {}          # intermittent medications (antibiotics, …)

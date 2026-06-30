@@ -12,7 +12,7 @@ varies (``LAB//lactate//mmol/l//bmp`` is 4 levels, ``RESP//device_category//imv`
 * **numeric** codes (any event carries a ``numeric_value``) → **2 levels**
   ``DOMAIN//concept``  (``LAB//lactate``, ``MED_INT//vancomycin``, ``VITAL//heart_rate``)
 * **categorical** codes (text-only) → **3 levels**
-  ``DOMAIN//category//value``  (``RESP//device_category//imv``, ``CRRT//crrt_mode_category//cvvhdf``)
+  ``DOMAIN//category//value``  (``RESP//device_category//imv``)
 
 So every lactate draw counts as one feature regardless of unit (mmol/l vs mg/dl) or
 order type, and every vancomycin dose regardless of unit/action — the count answers
@@ -35,6 +35,8 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
+
+from tqdm.auto import tqdm
 
 import numpy as np
 import polars as pl
@@ -98,7 +100,8 @@ class Counts:
     n_rows: int
 
 
-def compute_counts(events, task_df: pl.DataFrame, n_chunks: int = 8) -> Counts:
+def compute_counts(events, task_df: pl.DataFrame, n_chunks: int = 8,
+                   desc: str | None = None) -> Counts:
     """Run the heavy, vocab-independent point-in-time count join → ``Counts``.
 
     This is everything up to (but not including) vocabulary resolution, so the
@@ -146,7 +149,8 @@ def compute_counts(events, task_df: pl.DataFrame, n_chunks: int = 8) -> Counts:
 
     # Aggregate counts one block-hash partition at a time → bounded peak memory.
     r_parts, c_parts, n_parts = [], [], []
-    for k in range(n_chunks):
+    for k in tqdm(range(n_chunks), desc=desc or "count features",
+                  unit="chunk", leave=False):
         longk = (
             ev_int.filter(pl.col("chunk") == k)
             .join(preds_int.filter(pl.col("chunk") == k), on="jint", how="inner")
@@ -188,13 +192,12 @@ def counts_to_X(counts: Counts, vocab: list[str] | None = None
     # Resolve vocabulary → a cint → column-index lookup array. Vocab entries are
     # truncated codes, aligned to the cint factorization above.
     if vocab is None:
-        is_train = counts.split == "train"
-        train_cints = np.unique(cc[is_train[rr]]) if rr.size else np.empty(0, "int64")
-        order = sorted(train_cints.tolist(), key=lambda ci: trunc_by_cint[ci])
-        vocab = [trunc_by_cint[ci] for ci in order]
-        col_of = np.full(n_codes, -1, dtype="int64")
-        for col, ci in enumerate(order):
-            col_of[ci] = col
+        # Full code space: every extracted (truncated) code is a column, even with zero
+        # counts in train (all-zero column — harmless, trees never split on it). Keeps
+        # the feature space complete and identical across tasks/sites. trunc_by_cint is
+        # already unique and sorted by code name, so cint == column index here.
+        vocab = list(trunc_by_cint)
+        col_of = np.arange(n_codes, dtype="int64")
     else:
         name_to_cint = {trunc: ci for ci, trunc in enumerate(trunc_by_cint)}
         col_of = np.full(n_codes, -1, dtype="int64")
@@ -281,7 +284,8 @@ def load_counts(path: str | Path, task_df: pl.DataFrame) -> Counts | None:
 
 
 def count_features(events, task_df: pl.DataFrame, label_col: str,
-                   vocab: list[str] | None = None, n_chunks: int = 8
+                   vocab: list[str] | None = None, n_chunks: int = 8,
+                   desc: str | None = None
                    ) -> tuple[sp.csr_matrix, list[str], list[str]]:
     """Return (X_csr, prediction_ids, vocab). Row order = prediction_ids.
 
@@ -292,5 +296,5 @@ def count_features(events, task_df: pl.DataFrame, label_col: str,
     config extracted into MEDS is exactly what can be featured — to drop a
     domain, remove it from flair_elf_config.yaml.
     """
-    counts = compute_counts(events, task_df, n_chunks=n_chunks)
+    counts = compute_counts(events, task_df, n_chunks=n_chunks, desc=desc)
     return counts_to_X(counts, vocab=vocab)

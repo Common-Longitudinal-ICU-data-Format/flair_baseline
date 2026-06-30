@@ -79,7 +79,7 @@ def tune_xgb(X_train: sp.csr_matrix, y_train: np.ndarray, scale_pos_weight: floa
 
     study = optuna.create_study(direction="maximize",
                                 sampler=optuna.samplers.TPESampler(seed=0))
-    study.optimize(objective, n_trials=n_trials)
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
     return dict(study.best_params)
 
 
@@ -125,6 +125,7 @@ def train_and_score(X: sp.csr_matrix, prediction_ids: list[str], vocab: list[str
             **best, **_FIXED_PARAMS, eval_metric="logloss",
             scale_pos_weight=spw, n_jobs=-1,
         )
+        print(f"  fitting final model on {int(train_mask.sum()):,} rows …", flush=True)
         clf.fit(X_full[train_mask], y[train_mask])
         prob = clf.predict_proba(X_full)[:, 1]
         if model_out:

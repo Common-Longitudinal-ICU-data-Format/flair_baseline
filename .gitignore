@@ -1,5 +1,6 @@
-# flair lib is cloned in at deploy time (or symlinked for dev) — never committed
-/flair
+# flair lib ships as a prebuilt wheel under wheels/ — MUST be committed (do not ignore)
+!wheels/
+!wheels/*.whl
 
 # site-prefixed run outputs (PHI stays local; non-PHI is uploaded out-of-band)
 *_baseline_phi/

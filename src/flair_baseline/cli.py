@@ -160,7 +160,8 @@ def _pipeline(task_name: str, clif_config: str, elf_config: str, paths: TaskPath
         if counts is not None:
             typer.echo(f"[{task_name}] reusing cached features → {paths.features}")
     if counts is None:
-        counts = compute_counts(events_lf, score_cohort)
+        counts = compute_counts(events_lf, score_cohort,
+                                desc=f"[{task_name}] featurize")
         save_counts(paths.features, counts)
     if model_in:
         X, ids, _ = counts_to_X(counts, vocab=vocab_list)
@@ -224,7 +225,8 @@ def train_cmd(
     site = cfg.get("site")
     n_trials = hpo_trials if hpo else 0
     tasks = [resolve_task(task)] if task else list_tasks()
-    for t in tasks:
+    for i, t in enumerate(tasks, 1):
+        typer.echo(f"━━ {t} ({i}/{len(tasks)}) ━━")
         paths = TaskPaths.make(out, site, t)
         _pipeline(t, clif_config, elf_config, paths, train_end=train_end,
                   test_start=test_start, report=report, viz=viz, reuse=reuse,
@@ -242,6 +244,8 @@ def infer_cmd(
     task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = all 5"),
     report: bool = typer.Option(True, "--report/--no-report"),
     viz: bool = typer.Option(True, "--viz/--no-viz"),
+    reuse: bool = typer.Option(False, "--reuse/--no-reuse",
+                               help="Reuse cached cohort/MEDS/features if present"),
 ) -> None:
     """Score a shipped model on this site's data; report on a deterministic 25% test split."""
     import json
@@ -252,7 +256,8 @@ def infer_cmd(
     site = cfg.get("site")
     models_root = Path(models_dir)
     tasks = [resolve_task(task)] if task else list_tasks()
-    for t in tasks:
+    for i, t in enumerate(tasks, 1):
+        typer.echo(f"━━ {t} ({i}/{len(tasks)}) ━━")
         model_path = models_root / t / "model.json"
         vocab_path = models_root / t / "vocab.json"
         if not (model_path.exists() and vocab_path.exists()):
@@ -261,7 +266,7 @@ def infer_cmd(
         vocab_list = json.loads(vocab_path.read_text())["vocab"]
         paths = TaskPaths.make(out, site, t)
         _pipeline(t, clif_config, elf_config, paths, model_in=str(model_path),
-                  vocab_list=vocab_list, report=report, viz=viz)
+                  vocab_list=vocab_list, report=report, viz=viz, reuse=reuse)
 
 
 def main() -> None:
