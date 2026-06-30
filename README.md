@@ -1,190 +1,325 @@
 # flair-baseline
 
-XGBoost count-feature baseline for the FLAIR ICU benchmark (all 5 tasks).
+XGBoost count-feature baseline for the FLAIR ICU benchmark.
 
-A **self-contained sub-project**: it carries its own config and pins the FLAIR library, bundled as a prebuilt wheel under `wheels/` (until `flair-benchmark` is published on PyPI). Train once at a source site (MIMIC), ship the **models folder** to other sites, and re-run there — the code travels to the data, not the other way around.
+The model is trained once by the model owner, then each site runs inference on its own CLIF data and uploads only the non-PHI report folder.
 
-## What it does
+Patient-level data never leaves the site.
 
-The pipeline is **staged** — run the subcommands in sequence (the CLIF→MEDS ETL is built **once**, not per task):
+## Quick Start For CLIF Sites
 
-1. **`build-cohorts`** → each task's cohort (one row per `prediction_id`, with `split`), always carrying both train+test. On MIMIC the split is **75/25 on `hospitalization_join_id`** (an encounter never spans train and test); at an external site the same deterministic 75/25 block split is re-applied, so the model is evaluated on a **25% holdout** of that site's data. Also writes `table1.json`.
-2. **`build-data`** runs the vendored CLIF→MEDS ETL **once** over the **union of all task cohorts** — each `hospitalization_join_id` expanded to its full **stitched membership** (sibling hospitalizations included, so no encounter event is dropped) — into one shared `_shared/MEDS/` store.
-3. **`featurize`** — per task, counts each ELF code with `time < prediction_dttm` (strict point-in-time, no leakage) off the shared store, and derives that task's `codes.parquet` (code registry, counts floored to the suppression threshold). The feature **vocabulary is a fixed, committed `vocab.json`** shared by every task and site (not fit per task) — so every model has the same columns and bundles are interchangeable.
-4. **`train`** fits XGBoost per task on the fixed vocab; **`infer`** loads a shipped model instead. Both score all rows → `preds.parquet` + a **FLAIR report** bundle, scored by the per-task mode below.
+Use this section if you are a participating CLIF site and only need to run inference.
 
-### Report bundle (per task)
+### 1. Install Once
 
-`build_report` is keyed on the unit of prediction. Each pillar is one JSON of metrics + raw curve arrays + 95% bootstrap CIs, evaluated at the task's fixed clinical threshold; `--viz` also renders sanity-check PNGs (never uploaded).
-
-| mode | tasks | pillars |
-|------------------------|------------------------|------------------------|
-| **episodic** | task3, task5 | `discrimination`, `calibration`, `dca`, `fairness` |
-| **landmark** | task1, task2 | the four pillars **per lead-time landmark** + `leadtime` (per-window sensitivity, median lead-time, risk trajectory by outcome) |
-| **peak** | task4 | `discrimination` + `fairness` (+ NNE); calibration/DCA omitted (peak-calibration trap) |
-
-Feature domains (`flair_elf_config.yaml`): all vitals, all labs, respiratory support, patient assessments (GCS + RASS), continuous + intermittent medications.
-
-> The ELF config is the **single source of truth**: the domains listed there are exactly what gets extracted into MEDS *and* exactly what the model can use as features (no separate exclude list). `HOSP_DX` (discharge diagnoses, timestamped at discharge → leaky) is intentionally omitted. To include/exclude a domain, add/remove it there.
-
-## Output: three site-prefixed folders
-
-Every run writes under one `--out` root (default `.`), into three folders prefixed with the `site` from your config. Only the **non-PHI** folder is meant to leave the site.
-
-```         
-<site>_baseline_phi/_shared/MEDS/            shared CLIF→MEDS events (built once, all tasks)   ← stays local (PHI)
-<site>_baseline_phi/<task>/                  cohort.parquet, features.npz, preds.parquet      ← stays local (PHI)
-<site>_baseline_non_phi_for_upload/<task>/   codes.parquet, table1.json, report/*.json, report/viz/*.png   ← upload this
-<site>_baseline_models/<task>/               model.json, vocab.json                            ← ship to other sites
-```
-
-Model folders keep their **training-site** prefix; PHI + non-PHI folders carry the **running-site** prefix.
-
-## Two roles
-
-| role | who | does | publishes |
-|------------------|------------------|------------------|------------------|
-| **Model owner** | the FLAIR baseline team (trains on MIMIC) | `train` → fits the 5 models | uploads `mimic_baseline_models/` to the FLAIR website |
-| **CLIF site** | each participating ICU site | downloads the models, `infer` on local data | uploads its `*_non_phi_for_upload/` results back |
-
-Only two things ever move: the **models folder** (owner → site) and the **non-PHI results folder** (site → FLAIR). Patient data never leaves a site.
-
-### All commands at a glance
-
-After the shared setup below, the full sequence per role:
+Run this after cloning the repo, or whenever dependencies change:
 
 ``` bash
-# ── Model owner (trains on MIMIC) ──────────────────────────────────────────────
-# config: "site": "mimic", MIMIC data_directory
-uv run flair-baseline build-cohorts --clif-config config/clif_config.json --out .   # 5 cohorts + table1
-uv run flair-baseline build-data    --clif-config config/clif_config.json --out .   # ONE shared MEDS (ETL once)
-uv run flair-baseline build-vocab   --clif-config config/clif_config.json --out .   # regen vocab.json (commit it)
-uv run flair-baseline featurize     --clif-config config/clif_config.json --out .   # per-task features + codes
-uv run flair-baseline train         --clif-config config/clif_config.json --out . --viz   # fit 5 models (+ --no-hpo to skip HPO)
-# → publish mimic_baseline_models/  (build-vocab is owner-only; sites use the committed vocab.json)
-
-# ── CLIF site (infers on local data) ───────────────────────────────────────────
-# config: "site": "<yoursite>", your data_directory; drop the model bundle into ./mimic_baseline_models/
-uv run flair-baseline build-cohorts --clif-config config/clif_config.json --out .
-uv run flair-baseline build-data    --clif-config config/clif_config.json --out . --holdout-only   # test-split joins only
-uv run flair-baseline featurize     --clif-config config/clif_config.json --out . --holdout-only
-uv run flair-baseline infer --models-dir mimic_baseline_models \
-  --clif-config config/clif_config.json --out . --viz
-# → upload only <yoursite>_baseline_non_phi_for_upload/
+uv sync
 ```
 
-Shortcuts: `prepare` runs `build-cohorts → build-data → featurize` in one call (add `--holdout-only` for a site).
-Add `--task task1` to any command to run a single task. Low-RAM box: add `--pmc --batch-size N` to `build-data`.
-
-### Shared setup (both roles, once)
+### 2. Create Your Local Config
 
 ``` bash
-git clone <baseline-repo> flair_baseline && cd flair_baseline
-uv sync                               # installs flair-benchmark from wheels/*.whl + xgboost
-
 cp config/clif_config.template.json config/clif_config.json
-# edit config/clif_config.json: set "site" (prefixes every output folder) and "data_directory"
 ```
 
-The fixed feature vocabulary `vocab.json` ships committed in this repo — both `train` and
-`infer` load it, so every model and every site share one column space. Maintainers
-regenerate it with `build-vocab` (see below); sites never touch it.
+Edit `config/clif_config.json` with your local site name and CLIF data location.
 
-For both train and inference sites, the FLAIR library ships **prebuilt** as `wheels/flair_benchmark-*.whl` (committed in this repo), so there is nothing to clone or symlink — `uv sync` installs it from there. This is the interim mechanism until `flair-benchmark` is published on PyPI, at which point the `[tool.uv.sources]` wheel pin drops and `uv sync` resolves it from the index.
+Use generic values like this:
 
-> **Updating the bundled library** (maintainers only): rebuild the wheel from the FLAIR repo, then re-sync.
->
-> ``` bash
-> uv build --wheel --out-dir flair_baseline/wheels   # run from the flair repo
-> rm -f flair_baseline/wheels/.gitignore             # uv writes a `*` ignore — drop it so the wheel ships
-> # then, in flair_baseline/:
-> rm uv.lock && uv lock                              # same version → uv pins the OLD hash; regen to pick up new wheel
-> uv sync --reinstall-package flair-benchmark
-> ```
->
-> (If the version string changed, also bump the filename in `pyproject.toml` `[tool.uv.sources]`.)
+``` json
+{
+    "site": "example_site",
+    "data_directory": "/path/to/local/clif/data",
+    "filetype": "parquet",
+    "timezone": "US/Central",
+    "stitch_time_interval_hours": 6,
+    "cache_directory": "./output"
+}
+```
 
-------------------------------------------------------------------------
+`site` becomes the prefix for output folders, for example `example_site_baseline_non_phi_for_upload/`.
 
-### Role A — Model owner (FLAIR baseline, on MIMIC)
+`data_directory` should point to the folder containing your local CLIF tables, for example files named `clif_patient.parquet`, `clif_hospitalization.parquet`, `clif_vitals.parquet`, and related CLIF tables.
 
-1.  Set `"site": "mimic"` and the MIMIC `data_directory` in `config/clif_config.json`.
+`config/clif_config.json` is ignored by git because it is site-specific.
 
-2.  Run the staged pipeline, then train all 5 tasks:
+### 3. Add The Model Bundle
 
-    ``` bash
-    uv run flair-baseline build-cohorts --clif-config config/clif_config.json --out .
-    uv run flair-baseline build-data    --clif-config config/clif_config.json --out .   # ETL once
-    uv run flair-baseline featurize     --clif-config config/clif_config.json --out .
-    uv run flair-baseline train         --clif-config config/clif_config.json --out . --viz
-    # or, the first three in one go:  uv run flair-baseline prepare --clif-config … --out .
-    ```
+Download or copy the trained model bundle into the repository root.
 
-    > **Low-memory box?** add the hidden `--pmc --batch-size N` to `build-data` (poor-man's-compute):
-    > it extracts the shared MEDS in sequential N-encounter batches to part-files, so peak RAM
-    > is one batch instead of the whole cohort. Output is identical, just slower.
+The expected folder layout is:
 
-3.  Three folders appear: `mimic_baseline_phi/` (local, incl. the shared `_shared/MEDS/`), `mimic_baseline_non_phi_for_upload/` (MIMIC's own results), and **`mimic_baseline_models/`** — the per-task `model.json` + `vocab.json`.
+``` text
+mimic_baseline_models/
+  task1_icu_daily_mortality/model.json
+  task1_icu_daily_mortality/vocab.json
+  task2_icu_daily_ltach/model.json
+  task2_icu_daily_ltach/vocab.json
+  task3_extubation_failure_24h/model.json
+  task3_extubation_failure_24h/vocab.json
+  task4_sepsis_abx_6h/model.json
+  task4_sepsis_abx_6h/vocab.json
+  task5_icu_readmission/model.json
+  task5_icu_readmission/vocab.json
+```
 
-4.  **Publish `mimic_baseline_models/`** to the FLAIR website as the downloadable model bundle. That folder is all a CLIF site needs.
+### 4. Run Inference
 
-> **Regenerating the fixed vocabulary** (maintainers, rarely): after `build-data`, run
-> `uv run flair-baseline build-vocab --clif-config config/clif_config.json --out .` → writes
-> `vocab.json`; commit it. All tasks/sites then share that feature space.
+Recommended site command:
 
-------------------------------------------------------------------------
+``` bash
+uv run flair-baseline prepare --clif-config config/clif_config.json --out . --holdout-only --reuse --pmc
+uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config config/clif_config.json --out . --viz
+```
 
-### Role B — CLIF site (participating ICU)
+What this does:
 
-1.  Finish the shared setup above; set your own `"site"` (e.g. `"rush"`) and `data_directory`.
+`prepare` runs `build-cohorts`, `build-data`, and `featurize` in one command.
 
-2.  **Download the models folder** from the FLAIR website and drop it into the baseline folder, e.g. `flair_baseline/mimic_baseline_models/` (unzip here; keep the per-task subfolders).
+`--holdout-only` extracts and featurizes only the deterministic 25% test split used for external inference.
 
-3.  Run inference — same staged commands, but scope the data pull to your **25% holdout**
-    with `--holdout-only` (only those encounters' join ids are ETL'd / featurized):
+`--reuse` reuses the shared MEDS output if the manifest still matches.
 
-    ``` bash
-    uv run flair-baseline build-cohorts --clif-config config/clif_config.json --out .
-    uv run flair-baseline build-data    --clif-config config/clif_config.json --out . --holdout-only
-    uv run flair-baseline featurize     --clif-config config/clif_config.json --out . --holdout-only
-    uv run flair-baseline infer --models-dir mimic_baseline_models \
-      --clif-config config/clif_config.json --out . --viz
-    # one task only: add --task task1 to each command
-    ```
+`--pmc` stands for `poor-man's-compute`. It uses batched ETL to reduce peak memory usage. It is slower but safer on lower-memory machines.
 
-    Your cohort is still built in full (train+test, so Table 1 ships complete) — only the
-    ETL + featurization are restricted to the test-split encounters, saving compute.
+When `--pmc` is used, the default batch size is `4000` encounters. You can tune it with `--batch-size N`. Smaller values use less memory but run slower; larger values may run faster but need more memory.
 
-4.  Three folders appear, prefixed with **your** site name:
+`infer` loads the shipped models, scores the holdout rows, and writes report JSONs and optional PNG visualizations.
 
-    - `rush_baseline_phi/` — cohort, shared `_shared/MEDS/`, features, preds → **stays on your machine** (PHI, never upload).
-    - `rush_baseline_models/` — the models you ran (already public).
-    - **`rush_baseline_non_phi_for_upload/`** — codes registry, Table 1, report JSONs + PNGs.
+### 5. Upload Only The Non-PHI Folder
 
-5.  **Upload only `rush_baseline_non_phi_for_upload/`** to the FLAIR website (or the provided secure Box link). Nothing else leaves your site.
+After inference, upload only:
 
-> Quick check before upload: the folder holds only `codes.parquet`, `table1.json`, and `report/` — no `cohort.parquet`, `_shared/MEDS/`, `features.npz`, or `preds.parquet`. All cell counts \< 10 are already suppressed (`"<10"`).
+``` text
+example_site_baseline_non_phi_for_upload/
+```
 
-## Results (MIMIC-IV, 75/25 join-id split)
+Do not upload:
 
-> Note: the table below predates the shared-MEDS rebuild. Pulling every stitched
-> **sibling** hospitalization (previously dropped) adds events, so counts and AUROCs
-> shift slightly upward on retrain — regenerate the table after a fresh `train`.
+``` text
+example_site_baseline_phi/
+```
 
-**Report AUROC** is the headline metric in `discrimination.json` — the one that gets uploaded. It is mode-matched (episodic = one row/stay; peak = stay-peak risk; landmark = the lead-0 landmark, i.e. each stay's last window). The **row-level** column is the raw per-prediction-row AUROC for context — for peak/landmark tasks it differs because a stay contributes many correlated rows, so it is not the deployed metric.
+The PHI folder contains cohorts, features, shared MEDS events, and predictions. It should stay local.
 
-| task | mode | report AUROC (test) | n_stays | row-level |
-|---------------|---------------|--------------:|--------------:|--------------:|
-| task1 ICU daily mortality | landmark (lead-0) | 0.864 \[0.856, 0.872\] | 18,195 | 0.790 |
-| task2 ICU daily LTACH | landmark (lead-0) | 0.789 \[0.775, 0.803\] | 18,195 | 0.752 |
-| task3 extubation failure 24h | episodic | 0.696 \[0.665, 0.719\] | 6,693 | 0.696 |
-| task4 sepsis ABX 6h | peak | 0.693 \[0.678, 0.709\] | 19,943 | 0.815 |
-| task5 ICU readmission | episodic | 0.641 \[0.626, 0.658\] | 16,806 | 0.641 |
+## Output Folders
 
-> Landmark tasks report 12 per-lead-time AUROCs (see `leadtime.json` / the `landmarks[]` array); the table shows lead-0 as a single summary. task4 peak (0.69) vs its row-level (0.81) is the peak-trap in action — per-window pooling overstates deployed skill.
+Every run writes site-prefixed folders under `--out`.
 
-## Scale notes
+| Folder | Contains | Upload? |
+|------------------------|------------------------|------------------------|
+| `<site>_baseline_phi/` | `cohort.parquet`, shared `_shared/MEDS/`, `features.npz`, `preds.parquet` | No |
+| `<site>_baseline_non_phi_for_upload/` | `codes.parquet`, `table1.json`, report JSONs, optional report PNGs | Yes |
+| `mimic_baseline_models/` | Public trained model bundle used for inference | No |
 
-- The featurizer factorizes codes + encounter blocks to int32 and runs the event→prediction join in `n_chunks` block-hash partitions (default 8), so peak memory is \~1/n_chunks of the aggregation. This keeps even task4 — **14.3M hourly predictions, \~95M events, \~930M feature non-zeros** — within a 16 GB machine (peak ≈ 12 GB, \~21 min featurize + \~5 min train). Features are sparse CSR throughout.
-- `build-data` runs the CLIF→MEDS ETL **once** over the union of all 5 task cohorts (each encounter expanded to its full stitched membership) → `_shared/MEDS/`. Since the tasks overlap heavily on `hospitalization_join_id`, this replaces up to 5× redundant per-task extraction. `featurize` scans the shared store lazily, restricting to each task's encounters via the inner join.
-- The hidden `-pmc` (poor-man's-compute) mode on `build-data` (`--pmc --batch-size N`) extracts the shared MEDS in sequential N-encounter batches to `part-NNNN.parquet` files, bounding peak RAM to one batch — identical output, slower. Without it, a single `part-0000.parquet` is written.
+Quick upload check:
+
+``` text
+<site>_baseline_non_phi_for_upload/<task>/codes.parquet
+<site>_baseline_non_phi_for_upload/<task>/table1.json
+<site>_baseline_non_phi_for_upload/<task>/report/*.json
+<site>_baseline_non_phi_for_upload/<task>/report/viz/*.png
+```
+
+The upload folder should not contain `cohort.parquet`, `_shared/MEDS/`, `features.npz`, or `preds.parquet`.
+
+## Common Site Commands
+
+### Run All Tasks, Low-Memory Safe
+
+This is the recommended default for most sites:
+
+``` bash
+uv run flair-baseline prepare --clif-config config/clif_config.json --out . --holdout-only --reuse --pmc
+uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config config/clif_config.json --out . --viz
+```
+
+To lower memory further, reduce the batch size:
+
+``` bash
+uv run flair-baseline prepare --clif-config config/clif_config.json --out . --holdout-only --reuse --pmc --batch-size 1000
+uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config config/clif_config.json --out . --viz
+```
+
+### Run All Tasks Without Batched ETL
+
+Use this if the machine has enough memory and you want a simpler single-pass ETL:
+
+``` bash
+uv run flair-baseline prepare --clif-config config/clif_config.json --out . --holdout-only --reuse
+uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config config/clif_config.json --out . --viz
+```
+
+### Run One Task Only
+
+Add `--task task1`, `--task task2`, `--task task3`, `--task task4`, or `--task task5` to both commands.
+
+``` bash
+uv run flair-baseline prepare --clif-config config/clif_config.json --out . --holdout-only --reuse --pmc --task task1
+uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config config/clif_config.json --out . --viz --task task1
+```
+
+### Run The Stages Manually
+
+Use this only if you want more control or need to restart from a specific stage:
+
+``` bash
+uv run flair-baseline build-cohorts --clif-config config/clif_config.json --out .
+uv run flair-baseline build-data --clif-config config/clif_config.json --out . --holdout-only --reuse --pmc
+uv run flair-baseline featurize --clif-config config/clif_config.json --out . --holdout-only
+uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config config/clif_config.json --out . --viz
+```
+
+## What The Pipeline Does
+
+The inference workflow has four stages.
+
+| Stage | Command | Output |
+|------------------------|------------------------|------------------------|
+| 1 | `build-cohorts` | Per-task cohorts with train/test split and `table1.json` |
+| 2 | `build-data` | One shared CLIF-to-MEDS store under `<site>_baseline_phi/_shared/MEDS/` |
+| 3 | `featurize` | Sparse count features per task plus uploadable `codes.parquet` |
+| 4 | `infer` | Predictions, report JSONs, and optional visualizations |
+
+The `prepare` command runs stages 1 through 3.
+
+At external sites, `--holdout-only` keeps the expensive ETL and featurization scoped to the 25% test split. The full cohort is still built so `table1.json` can describe the full local cohort.
+
+## Tasks
+
+| Task    | Name                               | Report mode |
+|---------|------------------------------------|-------------|
+| `task1` | ICU daily in-hospital mortality    | Landmark    |
+| `task2` | ICU daily LTACH discharge          | Landmark    |
+| `task3` | Extubation failure within 24 hours | Episodic    |
+| `task4` | Sepsis antibiotics within 6 hours  | Peak        |
+| `task5` | ICU readmission                    | Episodic    |
+
+Report modes:
+
+`landmark` reports metrics at lead-time landmarks and includes `leadtime.json`.
+
+`episodic` reports one prediction per stay.
+
+`peak` evaluates each stay by peak risk and omits calibration and DCA because peak-risk calibration is not meaningful.
+
+## Feature Inputs
+
+The feature domains are controlled by `flair_elf_config.yaml`.
+
+Included domains:
+
+| Domain    | Description                                 |
+|-----------|---------------------------------------------|
+| `VITAL`   | Vitals                                      |
+| `LAB`     | Labs                                        |
+| `RESP`    | Respiratory support                         |
+| `PA`      | Patient assessments, including GCS and RASS |
+| `MED_CON` | Continuous medications                      |
+| `MED_INT` | Intermittent medications                    |
+
+The ELF config is the single source of truth for what is extracted into MEDS and what can be used as count features.
+
+Discharge diagnoses are intentionally not used as features because they are assigned after the stay and can leak outcome information.
+
+## Model Owner Workflow
+
+Use this section only if you are training or refreshing the source model bundle.
+
+Set `config/clif_config.json` to the source training site and run:
+
+``` bash
+uv run flair-baseline build-cohorts --clif-config config/clif_config.json --out .
+uv run flair-baseline build-data --clif-config config/clif_config.json --out .
+uv run flair-baseline build-vocab --clif-config config/clif_config.json --out .
+uv run flair-baseline featurize --clif-config config/clif_config.json --out .
+uv run flair-baseline train --clif-config config/clif_config.json --out . --viz
+```
+
+This writes:
+
+``` text
+<training_site>_baseline_phi/
+<training_site>_baseline_non_phi_for_upload/
+<training_site>_baseline_models/
+```
+
+Publish only the model bundle folder for sites to use for inference.
+
+`build-vocab` is for maintainers/model owners. CLIF inference sites should use the vocabulary shipped in the model bundle and should not regenerate it.
+
+## Configuration Reference
+
+`config/clif_config.json` fields:
+
+| Field | Meaning |
+|------------------------------------|------------------------------------|
+| `site` | Short site label used to prefix output folders |
+| `data_directory` | Local path to CLIF tables |
+| `filetype` | Usually `parquet` |
+| `timezone` | Local timezone used for CLIF datetimes |
+| `stitch_time_interval_hours` | Gap used for encounter stitching, usually `6` |
+| `cache_directory` | Local cache directory used by CLIF tooling |
+
+The committed `vocab.json` and the per-task `vocab.json` files in the model bundle keep feature columns aligned across sites.
+
+## Troubleshooting
+
+### Do I Need `uv sync` Every Time?
+
+No. Run `uv sync` once after cloning or when dependencies change. If `uv run flair-baseline ...` works, the environment is already ready.
+
+### The ETL Prints Datetime Warnings
+
+Warnings like this may appear:
+
+``` text
+Naive datetime localized to US/Central. Please verify this is correct.
+```
+
+These are informational unless the command exits with an error. Confirm that `timezone` in `config/clif_config.json` matches the local CLIF data conventions.
+
+### The ETL Prints Medication Unit Warnings
+
+Warnings about missing medication categories or unsupported preferred-unit conversion can appear when a site does not contain certain medications or units. These are commonly non-fatal. If the command completes, the pipeline continued with the available mapped data.
+
+### Restart After A Failed Run
+
+If cohorts were built successfully, you can rerun the recommended commands. `--reuse` will reuse matching shared MEDS artifacts when possible.
+
+``` bash
+uv run flair-baseline prepare --clif-config config/clif_config.json --out . --holdout-only --reuse --pmc
+uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config config/clif_config.json --out . --viz
+```
+
+### Need To Save Memory?
+
+Keep `--pmc` (`poor-man's-compute`) on the `prepare` command. It batches the shared MEDS extraction into part files so peak RAM is bounded by one batch instead of the whole cohort.
+
+The default `--pmc` batch size is `4000` encounters. If memory is still tight, set a smaller batch size:
+
+``` bash
+uv run flair-baseline prepare --clif-config config/clif_config.json --out . --holdout-only --reuse --pmc --batch-size 1000
+```
+
+Use a larger `--batch-size` only if the machine has enough memory.
+
+You can also run one task at a time with `--task taskN`.
+
+## Development Notes
+
+The FLAIR benchmark library is bundled as a wheel under `wheels/` and pinned in `pyproject.toml`.
+
+Maintainers updating the bundled library should rebuild the wheel, refresh the lockfile if needed, and reinstall the package:
+
+``` bash
+uv build --wheel --out-dir flair_baseline/wheels
+rm -f flair_baseline/wheels/.gitignore
+rm uv.lock
+uv lock
+uv sync --reinstall-package flair-benchmark
+```
+
+If the package version or wheel filename changes, update `[tool.uv.sources]` in `pyproject.toml`.
