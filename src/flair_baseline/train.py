@@ -16,8 +16,45 @@ import xgboost as xgb
 
 JOIN_ID = "hospitalization_join_id"
 
-# Extra dense numeric features pulled from the cohort (appended after the count columns).
-_EXTRA_FEATURES = ["age_at_admission"]
+# Dense extra features appended after the count columns, in this fixed order:
+#   [ _EXTRA_NUMERIC... , sex__<cat>... , time_since_first_hrs ]
+# The order is fixed in code (not read back from the sidecar) so train and infer —
+# and every site — produce an identical column layout.
+_EXTRA_NUMERIC = ["age_at_admission"]     # continuous cohort numerics (fill_null → 0)
+# Fixed one-hot sex columns. A present sex → 1.0/0.0; a sex outside this set
+# (null / Unknown / Other) → NaN in BOTH columns so XGBoost routes it as missing.
+_SEX_CATEGORIES = ["Female", "Male"]
+
+
+def _build_extras(d: pl.DataFrame, time_since_first: np.ndarray | None
+                  ) -> tuple[np.ndarray | None, list[str]]:
+    """Assemble dense extra feature columns + their names, in the fixed order.
+
+    ``d`` is the cohort rows already aligned to the CSR row order; ``time_since_first``
+    (if given) is in that same row order. Returns (dense matrix or None, names).
+    """
+    cols: list[np.ndarray] = []
+    names: list[str] = []
+    for c in _EXTRA_NUMERIC:
+        if c in d.columns:
+            cols.append(d[c].cast(pl.Float64).fill_null(0.0).to_numpy())
+            names.append(c)
+    if "sex_category" in d.columns:
+        for cat in _SEX_CATEGORIES:
+            # present rows → 1.0/0.0; sex ∉ _SEX_CATEGORIES → null → NaN (missing).
+            col = (
+                pl.when(pl.col("sex_category").is_in(_SEX_CATEGORIES))
+                .then((pl.col("sex_category") == cat).cast(pl.Float64))
+                .otherwise(None)
+            )
+            cols.append(d.select(col.alias("s"))["s"].to_numpy())
+            names.append(f"sex__{cat}")
+    if time_since_first is not None:
+        cols.append(np.asarray(time_since_first, dtype="float64"))
+        names.append("time_since_first_hrs")
+    if not cols:
+        return None, []
+    return np.column_stack(cols), names
 
 # Fixed XGBoost params used by both HPO trials and the final fit (only the
 # search-space params below are tuned).
@@ -87,18 +124,20 @@ def train_and_score(X: sp.csr_matrix, prediction_ids: list[str], vocab: list[str
                     task_df: pl.DataFrame, label_col: str, *,
                     model_out: str | None = None, vocab_out: str | None = None,
                     params_out: str | None = None, n_trials: int = 30,
-                    model_in: str | None = None) -> pl.DataFrame:
+                    model_in: str | None = None,
+                    time_since_first: np.ndarray | None = None) -> pl.DataFrame:
     """Train (unless model_in given) and score every prediction. Returns the preds frame."""
-    extras = [c for c in _EXTRA_FEATURES if c in task_df.columns]
+    have = [c for c in (*_EXTRA_NUMERIC, "sex_category") if c in task_df.columns]
     meta = task_df.select("prediction_id", "hospitalization_id", JOIN_ID,
-                          "split", label_col, *extras)
-    # Align cohort rows to X's row order (prediction_ids).
+                          "split", label_col, *have)
+    # Align cohort rows to X's row order (prediction_ids); time_since_first is
+    # already in that order, so it aligns to d/X positionally.
     order = pl.DataFrame({"prediction_id": prediction_ids}).with_row_index("_r")
     d = order.join(meta, on="prediction_id", how="left").sort("_r")
 
-    if extras:
-        age = d.select([pl.col(c).cast(pl.Float64).fill_null(0.0) for c in extras]).to_numpy()
-        X_full = sp.hstack([X, sp.csr_matrix(age.astype("float32"))], format="csr")
+    extra_mat, extras = _build_extras(d, time_since_first)
+    if extra_mat is not None:
+        X_full = sp.hstack([X, sp.csr_matrix(extra_mat.astype("float32"))], format="csr")
     else:
         X_full = X.tocsr()
 

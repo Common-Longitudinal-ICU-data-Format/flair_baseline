@@ -98,6 +98,10 @@ class Counts:
     prediction_ids: list[str]  # row order
     split: np.ndarray         # per-row split label ("train"/"test")
     n_rows: int
+    # Per-row hours from the encounter's first MEDS event to the prediction time
+    # (prediction_dttm − min(event.time) for that join_id). A dense extra feature,
+    # aligned to prediction_ids; carried here so it survives the counts cache.
+    time_since_first: np.ndarray = None  # float32[n_rows]
 
 
 def compute_counts(events, task_df: pl.DataFrame, n_chunks: int = 8,
@@ -171,8 +175,28 @@ def compute_counts(events, task_df: pl.DataFrame, n_chunks: int = 8,
     del r_parts, c_parts, n_parts
     gc.collect()
 
+    # Dense extra: hours from the encounter's first MEDS event to the prediction
+    # time. Uses ALL of the encounter's events (not the point-in-time-filtered set)
+    # — "first event" is the earliest record for that join_id. Per prediction row,
+    # in prediction_ids order, so it aligns to the CSR rows built downstream.
+    first_t = (
+        ev.select(JOIN_ID, pl.col("time").cast(pl.Datetime("us")))
+        .group_by(JOIN_ID).agg(pl.col("time").min().alias("t0"))
+        .collect(engine="streaming")
+    )
+    time_since_first = (
+        preds.select("r", JOIN_ID, "prediction_dttm")
+        .join(first_t, on=JOIN_ID, how="left")
+        .with_columns(
+            ((pl.col("prediction_dttm") - pl.col("t0")).dt.total_seconds() / 3600.0)
+            .alias("tse")
+        )
+        .sort("r")["tse"].fill_null(0.0).to_numpy().astype("float32")
+    )
+
     return Counts(rr=rr, cc=cc, nn=nn, trunc_by_cint=trunc_by_cint,
-                  prediction_ids=prediction_ids, split=split, n_rows=n_rows)
+                  prediction_ids=prediction_ids, split=split, n_rows=n_rows,
+                  time_since_first=time_since_first)
 
 
 def counts_to_X(counts: Counts, vocab: list[str] | None = None
@@ -240,11 +264,15 @@ def save_counts(path: str | Path, counts: Counts) -> None:
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    tse = counts.time_since_first
+    if tse is None:
+        tse = np.zeros(counts.n_rows, dtype="float32")
     np.savez_compressed(
         path,
         rr=counts.rr, cc=counts.cc, nn=counts.nn,
         prediction_ids=np.asarray(counts.prediction_ids, dtype=object).astype("U"),
         split=counts.split.astype("U"),
+        time_since_first=tse.astype("float32"),
     )
     # np.savez appends .npz if missing — normalize so the meta sidecar sits beside it.
     saved = path if path.suffix == ".npz" else path.with_suffix(".npz")
@@ -274,12 +302,19 @@ def load_counts(path: str | Path, task_df: pl.DataFrame) -> Counts | None:
     if meta.get("ids_hash") != _ids_hash(cohort_ids):
         return None
     with np.load(saved, allow_pickle=False) as z:
+        n_rows = int(meta["n_rows"])
+        # Backward-compat: npz written before the time_since_first feature has no
+        # such array → default to zeros (the feature is then a harmless zero column).
+        tse = (z["time_since_first"].astype("float32")
+               if "time_since_first" in z.files
+               else np.zeros(n_rows, dtype="float32"))
         return Counts(
             rr=z["rr"], cc=z["cc"], nn=z["nn"],
             trunc_by_cint=list(meta["trunc_by_cint"]),
             prediction_ids=z["prediction_ids"].tolist(),
             split=z["split"].astype(object).astype(str),
-            n_rows=int(meta["n_rows"]),
+            n_rows=n_rows,
+            time_since_first=tse,
         )
 
 

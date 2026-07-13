@@ -350,7 +350,8 @@ def train_cmd(
                    f"— training XGBoost ({f'HPO {n_trials} trials' if n_trials else 'fixed params'})")
         preds = train_and_score(X, ids, fixed_vocab, cohort, label_col,
                                 model_out=str(paths.model), vocab_out=str(paths.vocab),
-                                params_out=str(paths.params), n_trials=n_trials)
+                                params_out=str(paths.params), n_trials=n_trials,
+                                time_since_first=counts.time_since_first)
         preds.write_parquet(paths.preds)
         _report(paths, t, clif_config, preds, label_col, report, viz)
 
@@ -392,7 +393,8 @@ def infer_cmd(
         typer.echo(f"[{t}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} ({X.nnz:,} nnz) "
                    f"— scoring with shipped model")
         preds = train_and_score(X, ids, vocab_list, score_cohort, label_col,
-                                model_in=str(model_path))
+                                model_in=str(model_path),
+                                time_since_first=counts.time_since_first)
         preds.write_parquet(paths.preds)
         _report(paths, t, clif_config, preds, label_col, report, viz)
 
