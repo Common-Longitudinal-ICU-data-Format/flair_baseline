@@ -614,10 +614,11 @@ dependencies = [
     { name = "pyyaml" },
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scikit-learn", version = "1.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "threadpoolctl" },
     { name = "typer" },
 ]
 wheels = [
-    { filename = "flair_benchmark-0.0.1-py3-none-any.whl", hash = "sha256:848aac4dd0dd93264a0801bd9e0b70562a356859069e6de5f1f28adf33c11496" },
+    { filename = "flair_benchmark-0.0.1-py3-none-any.whl", hash = "sha256:5e3a57f1000dafdc7b538c6b058708ade15bf0a8f2f0d312c088fd54d2f2724d" },
 ]
 
 [package.metadata]
@@ -632,6 +633,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },
     { name = "scikit-learn", specifier = ">=1.3.0" },
+    { name = "threadpoolctl", specifier = ">=3.0.0" },
     { name = "typer", specifier = ">=0.12.0" },
 ]
 provides-extras = ["dev", "viz"]
