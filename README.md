@@ -59,8 +59,6 @@ mimic_baseline_models/
   task2_icu_daily_ltach/vocab.json
   task3_extubation_failure_24h/model.json
   task3_extubation_failure_24h/vocab.json
-  task4_sepsis_abx_6h/model.json
-  task4_sepsis_abx_6h/vocab.json
   task5_icu_readmission/model.json
   task5_icu_readmission/vocab.json
 ```
@@ -154,7 +152,7 @@ uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config con
 
 ### Run One Task Only
 
-Add `--task task1`, `--task task2`, `--task task3`, `--task task4`, or `--task task5` to both commands.
+Add `--task task1`, `--task task2`, `--task task3`, or `--task task5` to both commands.
 
 ``` bash
 uv run flair-baseline prepare --clif-config config/clif_config.json --out . --holdout-only --reuse --pmc --task task1
@@ -194,7 +192,6 @@ At external sites, `--holdout-only` keeps the expensive ETL and featurization sc
 | `task1` | ICU daily in-hospital mortality    | Landmark    |
 | `task2` | ICU daily LTACH discharge          | Landmark    |
 | `task3` | Extubation failure within 24 hours | Episodic    |
-| `task4` | Sepsis antibiotics within 6 hours  | Peak        |
 | `task5` | ICU readmission                    | Episodic    |
 
 Report modes:
@@ -202,8 +199,6 @@ Report modes:
 `landmark` reports metrics at lead-time landmarks and includes `leadtime.json`.
 
 `episodic` reports one prediction per stay.
-
-`peak` evaluates each stay by peak risk and omits calibration and DCA because peak-risk calibration is not meaningful.
 
 ## Feature Inputs
 

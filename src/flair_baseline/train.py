@@ -1,8 +1,12 @@
-"""XGBoost training + scoring for one task (sparse features).
+"""XGBoost training + scoring for one task (dense float32 features).
 
 Fits on the train split, scores every row (train+test) so the FLAIR report can bin
 by split. Demographics flow into the report via the cohort parquet, so the preds
 table carries only the report-required keys + predictions.
+
+NaN is load-bearing here, not incidental: the featurizer emits NaN for a statistic
+that was never measured (as distinct from a genuine 0 count), and XGBoost routes
+those cells down its own missing-value branch.
 """
 from __future__ import annotations
 
@@ -11,12 +15,11 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-import scipy.sparse as sp
 import xgboost as xgb
 
 JOIN_ID = "hospitalization_join_id"
 
-# Dense extra features appended after the count columns, in this fixed order:
+# Dense extra features appended after the featurizer's columns, in this fixed order:
 #   [ _EXTRA_NUMERIC... , sex__<cat>... , time_since_first_hrs ]
 # The order is fixed in code (not read back from the sidecar) so train and infer —
 # and every site — produce an identical column layout.
@@ -67,7 +70,7 @@ _DEFAULT_PARAMS = dict(
 )
 
 
-def tune_xgb(X_train: sp.csr_matrix, y_train: np.ndarray, scale_pos_weight: float,
+def tune_xgb(X_train: np.ndarray, y_train: np.ndarray, scale_pos_weight: float,
              n_trials: int = 30, max_tune_rows: int = 2_000_000) -> dict:
     """Optuna search → best XGBoost params (maximizing 5-fold CV AUROC).
 
@@ -76,7 +79,7 @@ def tune_xgb(X_train: sp.csr_matrix, y_train: np.ndarray, scale_pos_weight: floa
     dict (including ``n_estimators``) — fixed params / scale_pos_weight are added
     by the caller at final-fit time.
 
-    For very large tasks (e.g. the 14.5M-row sepsis grid) the CV would exhaust
+    For very large tasks (a multi-million-row hourly grid) the CV would exhaust
     RAM, so the *search* runs on a deterministic ``max_tune_rows`` subsample; the
     final model is still fit on the full train split by the caller.
     """
@@ -120,9 +123,10 @@ def tune_xgb(X_train: sp.csr_matrix, y_train: np.ndarray, scale_pos_weight: floa
     return dict(study.best_params)
 
 
-def train_and_score(X: sp.csr_matrix, prediction_ids: list[str], vocab: list[str],
-                    task_df: pl.DataFrame, label_col: str, *,
+def train_and_score(X: np.ndarray, prediction_ids: list[str],
+                    feature_names: list[str], task_df: pl.DataFrame, label_col: str, *,
                     model_out: str | None = None, vocab_out: str | None = None,
+                    vocab_meta: dict | None = None,
                     params_out: str | None = None, n_trials: int = 30,
                     model_in: str | None = None,
                     time_since_first: np.ndarray | None = None) -> pl.DataFrame:
@@ -136,10 +140,11 @@ def train_and_score(X: sp.csr_matrix, prediction_ids: list[str], vocab: list[str
     d = order.join(meta, on="prediction_id", how="left").sort("_r")
 
     extra_mat, extras = _build_extras(d, time_since_first)
+    X = np.asarray(X, dtype="float32")
     if extra_mat is not None:
-        X_full = sp.hstack([X, sp.csr_matrix(extra_mat.astype("float32"))], format="csr")
+        X_full = np.hstack([X, extra_mat.astype("float32")])
     else:
-        X_full = X.tocsr()
+        X_full = X
 
     y = d[label_col].cast(pl.Int32).fill_null(0).to_numpy()
     split = d["split"].to_numpy()
@@ -153,16 +158,18 @@ def train_and_score(X: sp.csr_matrix, prediction_ids: list[str], vocab: list[str
         base = float(y[train_mask].mean()) if train_mask.sum() else 0.0
         prob = np.full(X_full.shape[0], base, dtype="float32")
     else:
-        pos = float((y[train_mask] == 1).sum())
-        neg = float((y[train_mask] == 0).sum())
-        spw = neg / pos if pos > 0 else 1.0
+        # scale_pos_weight removed (was neg/pos). Upweighting the rare positive class
+        # improves ranking/recall but inflates predicted risk (O:E > 1) and wrecks
+        # probability calibration. Neutral weight keeps predictions on the prevalence
+        # scale; class imbalance is instead reflected honestly in the probabilities.
+        spw = 1.0
         if n_trials and n_trials > 0:
             best = tune_xgb(X_full[train_mask], y[train_mask], spw, n_trials=n_trials)
         else:
             best = dict(_DEFAULT_PARAMS)
         clf = xgb.XGBClassifier(
             **best, **_FIXED_PARAMS, eval_metric="logloss",
-            scale_pos_weight=spw, n_jobs=-1,
+            scale_pos_weight=spw, n_jobs=-1, missing=np.nan,
         )
         print(f"  fitting final model on {int(train_mask.sum()):,} rows …", flush=True)
         clf.fit(X_full[train_mask], y[train_mask])
@@ -170,7 +177,10 @@ def train_and_score(X: sp.csr_matrix, prediction_ids: list[str], vocab: list[str
         if model_out:
             clf.get_booster().save_model(model_out)
         if vocab_out:
-            Path(vocab_out).write_text(json.dumps({"vocab": vocab, "extras": extras}))
+            # "vocab"/"roles" are the truncated-code space (what infer resolves
+            # against); "features" is the expanded column layout they produce.
+            Path(vocab_out).write_text(json.dumps(
+                {**(vocab_meta or {}), "features": feature_names, "extras": extras}))
         if params_out:
             Path(params_out).write_text(json.dumps(
                 {**best, **_FIXED_PARAMS, "scale_pos_weight": spw}, indent=2))

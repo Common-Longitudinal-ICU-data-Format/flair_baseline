@@ -85,12 +85,15 @@ _FIXED_VOCAB = ["LAB//lactate", "RESP//device_category//imv", "MED_INT//ghostdru
 
 
 def test_fixed_vocab_constant_width_across_cohorts():
-    """The same supplied vocab → identical column count for two unrelated cohorts."""
-    Xa, _, va = count_features(_EVENTS_A, _COHORT_A, "label", vocab=_FIXED_VOCAB)
-    Xb, _, vb = count_features(_EVENTS_B, _COHORT_B, "label", vocab=_FIXED_VOCAB)
-    assert va == vb == _FIXED_VOCAB
-    assert Xa.shape[1] == Xb.shape[1] == len(_FIXED_VOCAB)
-    # A code absent from a site is an all-zero column, never a stored 0.
-    ghost = _FIXED_VOCAB.index("MED_INT//ghostdrug")
-    assert Xa[:, ghost].nnz == 0 and Xb[:, ghost].nnz == 0
-    assert (Xb.data == 0).sum() == 0
+    """The same supplied vocab → identical column layout for two unrelated cohorts."""
+    from flair_baseline.featurize import feature_names
+
+    expected = feature_names(_FIXED_VOCAB)
+    Xa, _, na = count_features(_EVENTS_A, _COHORT_A, "label", vocab=_FIXED_VOCAB)
+    Xb, _, nb = count_features(_EVENTS_B, _COHORT_B, "label", vocab=_FIXED_VOCAB)
+    assert na == nb == expected
+    assert Xa.shape[1] == Xb.shape[1] == len(expected)
+    # A medication absent from a site is an all-zero column — "never given", which is
+    # information, unlike a lab that was simply never drawn (NaN).
+    ghost = expected.index("MED_INT//ghostdrug")
+    assert (Xa[:, ghost] == 0).all() and (Xb[:, ghost] == 0).all()

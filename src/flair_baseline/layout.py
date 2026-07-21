@@ -27,8 +27,9 @@ from flair_benchmark._constants import TASK_POLICY
 def report_mode(task_name: str) -> str:
     """Report mode for a task — single-sourced from flair_benchmark/_constants.py.
 
-    task1/task2 = landmark (per lead-time), task4 = peak (stay-peak screening),
-    episode tasks (3, 5) = episodic. Anything unlisted defaults to episodic.
+    task1/task2 = landmark (per lead-time), episode tasks (3, 5) = episodic.
+    Anything unlisted defaults to episodic. The lookup stays generic, so a task
+    whose policy names another mode (e.g. peak) still routes correctly.
     """
     return TASK_POLICY.get(task_name, {}).get("report_mode", "episodic")
 

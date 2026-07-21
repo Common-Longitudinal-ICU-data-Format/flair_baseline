@@ -1,6 +1,6 @@
 # flair-baseline — end-to-end flow
 
-XGBoost **count-feature** baseline for all 5 FLAIR ICU tasks, trained on MIMIC-IV with a leak-free **75/25 split on `hospitalization_join_id`**. Features are counts of every ELF event code that occurs **strictly before** each prediction's `prediction_dttm` (point-in-time, no leakage). This is a **self-contained sub-project**: the FLAIR library is cloned in beside it (`./flair`) and pinned as an editable path dep; the baseline carries its own config (`config/`). Train once at a source site, ship the **models folder** to other sites, re-run there — the code travels to the data.
+XGBoost **count-feature** baseline for the FLAIR ICU tasks, trained on MIMIC-IV with a leak-free **75/25 split on `hospitalization_join_id`**. Features are counts of every ELF event code that occurs **strictly before** each prediction's `prediction_dttm` (point-in-time, no leakage). This is a **self-contained sub-project**: the FLAIR library is cloned in beside it (`./flair`) and pinned as an editable path dep; the baseline carries its own config (`config/`). Train once at a source site, ship the **models folder** to other sites, re-run there — the code travels to the data.
 
 Every run partitions its artifacts into three **site-prefixed** folders (see §3); only the non-PHI folder leaves the site.
 
@@ -54,18 +54,18 @@ flair-baseline train [--clif-config config/clif_config.json] [--elf-config flair
 | `--clif-config` | `config/clif_config.template.json` | `clif_config.json` (path, filetype, timezone, `site`). `site=mimic` ⇒ 75/25 split |
 | `--elf-config` | `flair_elf_config.yaml` | event concepts to extract (= the feature set) |
 | `--out` | `.` | root for the three `<site>_baseline_*` folders |
-| `--task` | all 5 | task name or prefix (`task1` → `task1_icu_daily_mortality`) |
+| `--task` | all tasks | task name or prefix (`task1` → `task1_icu_daily_mortality`) |
 | `--train-end` / `--test-start` | none | date cutoff for non-mimic sites (omit on mimic) |
 | `--report` / `--no-report` | report | build the FLAIR report bundle (mode per task; see §2⑤) |
 | `--viz` / `--no-viz` | no-viz | also render sanity-check PNGs into `report/viz/` |
 | `--reuse` / `--no-reuse` | no-reuse | reuse existing `cohort.parquet` + `MEDS.parquet` (skip ETL) |
 
 ``` bash
-# all 5 tasks on MIMIC, with report + PNGs
+# all tasks on MIMIC, with report + PNGs
 uv run flair-baseline train --clif-config config/clif_config.json --out . --viz
 
 # one task
-uv run flair-baseline train --task task4 --clif-config config/clif_config.json --out .
+uv run flair-baseline train --task task3 --clif-config config/clif_config.json --out .
 ```
 
 ### `flair-baseline infer` (new site — only the models folder travels)
@@ -159,7 +159,7 @@ The **mode** (chosen per task by `flair_baseline/layout.py:report_mode`) sets ho
 |---|---|---|
 | **episodic** | task3, task5 | `discrimination.json`, `calibration.json`, `dca.json`, `fairness.json` |
 | **landmark** | task1, task2 | the four pillars **per lead-time landmark** + `leadtime.json` |
-| **peak** | task4 | `discrimination.json` + `fairness.json` (+ NNE); calibration/DCA omitted (peak-calibration trap) |
+| **peak** | _(none currently)_ | `discrimination.json` + `fairness.json` (+ NNE); calibration/DCA omitted (peak-calibration trap) |
 
 - **episodic** — one prediction per stay; the four pillars straight up.
 - **landmark** — scores at 12 risk-set landmarks counting back from each stay's last window, so discrimination/calibration/DCA/fairness are reported *per lead-time*. `leadtime.json` adds per-window detection sensitivity, median lead-time (+CI), and the **predicted-risk trajectory by outcome** (mean risk for ever-positive vs negative stays at each landmark).
@@ -198,7 +198,7 @@ is meant to leave the site; models are what `train` ships to other sites.
 ```
 
 Landmark tasks (1, 2) wrap each pillar as `{metadata, landmarks:[…]}` (one entry per
-lead-time) and add `leadtime.json`. Peak task (4) omits `calibration.json`/`dca.json`.
+lead-time) and add `leadtime.json`. A peak-mode task would omit `calibration.json`/`dca.json`.
 
 ------------------------------------------------------------------------
 
@@ -250,14 +250,6 @@ lead-time) and add `leadtime.json`. Peak task (4) omits `calibration.json`/`dca.
 - MEDS **57,832,570** events / 13,543 codes.
 - Features **26,771 × 412**, 2.21M nnz. **Test AUROC 0.701**. 5 PNGs (one-per-stay → no window plots; `encounter.json` = `one_per_stay_task` stub, no lead-time/operating-curve PNGs).
 
-### task4 — Sepsis (CDC ASE onset) within 6 h
-
-- `label_sepsis_6h` · intervention · one-per-window (hourly grid, **hospital-wide**) · threshold 0.1.
-- Cohort **14,343,501** (10,735,052 train / 3,608,449 test; 5,541 test pos — 0.15 % prevalence).
-- MEDS **95,512,509** events / 18,635 codes.
-- Features **14,343,501 × 425**, **931.6M nnz**. **Test AUROC 0.812**. 9 PNGs (+ encounter — the canonical TREWS-style case: `label_sepsis_6h` gives genuine pre-onset lead time).
-- Scale: featurize \~1,283 s, train \~288 s, peak RSS \~12 GB (16 GB box) thanks to the chunked integerized featurizer.
-
 ### task5 — Unplanned ICU Readmission
 
 - `label_icu_readmission` · outcome · one-per-stay (episode) · threshold 0.2.
@@ -272,7 +264,6 @@ lead-time) and add `leadtime.json`. Peak task (4) omits `calibration.json`/`dca.
 | task1 ICU daily mortality    |  **0.790** |      433 | 49,362 (9,838)    |
 | task2 ICU daily LTACH        |  **0.757** |      433 | 49,362 (7,152)    |
 | task3 extubation failure 24h |  **0.701** |      412 | 6,694 (364)       |
-| task4 sepsis ABX 6h          |  **0.812** |      425 | 3,608,449 (5,541) |
 | task5 ICU readmission        |  **0.645** |      429 | 16,814 (1,562)    |
 
 Excluding HOSP_DX moved AUROC by ≤ 0.02 vs the leaky version — the post-hoc diagnoses were not real predictive signal, just leakage (and they had ballooned the vocab, e.g. task1 1,840 → 433).
@@ -302,16 +293,16 @@ Landmark files wrap each pillar as `{metadata, landmarks:[…]}` (one entry per 
 | `landmark_skill.png`, `landmark_sensitivity.png`, `landmark_calibration.png` | landmark | metric vs windows-before-end, per-point `n` annotated |
 | `landmark_risk_trajectory.png` | landmark | mean predicted risk vs windows-before-end, positive (label=1) vs negative (label=0) |
 
-**Calibration caveat (rare-event tasks, esp. task4):** `scale_pos_weight` inflates predicted probabilities for the rare positive class — the model **ranks** well (AUROC) but is not calibrated (slope ≪ 1, predicted ≫ observed). This is exactly why task4 runs in **peak** mode (calibration/DCA omitted). For tasks that do report calibration, recalibrate (Platt/isotonic) on a held-out split → slope/ECE/DCA become meaningful and cross-site comparable.
+**Calibration caveat (rare-event tasks):** `scale_pos_weight` inflates predicted probabilities for the rare positive class — the model **ranks** well (AUROC) but is not calibrated (slope ≪ 1, predicted ≫ observed). This is why a very-low-prevalence task belongs in **peak** mode (calibration/DCA omitted). For tasks that do report calibration, recalibrate (Platt/isotonic) on a held-out split → slope/ECE/DCA become meaningful and cross-site comparable.
 
 ------------------------------------------------------------------------
 
 ## 7. Scale & memory
 
-- Featurizer factorizes codes + blocks to int32 and runs the event→prediction join in `n_chunks` (default 8) block-hash partitions → peak ≈ 1/`n_chunks` of the aggregation. Even task4 (14.3M predictions, \~95M events, \~932M nnz) fits a 16 GB box (\~12 GB peak).
+- Featurizer factorizes codes + blocks to int32 and runs the event→prediction join in `n_chunks` (default 8) block-hash partitions → peak ≈ 1/`n_chunks` of the aggregation. Even a multi-million-row hourly grid (\~95M events, \~932M nnz) fits a 16 GB box (\~12 GB peak).
 - Everything downstream of the ELF events is sparse CSR.
-- `--reuse` skips the ETL (reads existing `cohort.parquet` + `data/MEDS.parquet`) — re-featurize / retrain / re-report in minutes (seconds for the small tasks; \~26 min for task4).
-- Full cold sweep ≈ ETL (a few min per task; loads full CLIF tables once) + task4 featurize \~21 min.
+- `--reuse` skips the ETL (reads existing `cohort.parquet` + `data/MEDS.parquet`) — re-featurize / retrain / re-report in minutes (seconds for the small tasks).
+- Full cold sweep ≈ ETL (a few min per task; loads full CLIF tables once).
 
 ------------------------------------------------------------------------
 
@@ -356,7 +347,7 @@ threshold) — enough for a coordinator to align and pool sites.
 
 ``` bash
 # copy a training site's models folder to this site, then:
-uv run flair-baseline infer --task task4 \
+uv run flair-baseline infer --task task3 \
   --models-dir mimic_baseline_models \
   --clif-config config/clif_config.json --out . --viz
 ```

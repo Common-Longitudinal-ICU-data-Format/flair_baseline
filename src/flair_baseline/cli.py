@@ -2,10 +2,10 @@
 
 Pipeline is split into stages you run in sequence (no per-task ETL re-runs):
 
-  flair-baseline build-cohorts --clif-config clif.json --out .   # 5 cohort.parquet + table1
+  flair-baseline build-cohorts --clif-config clif.json --out .   # one cohort.parquet + table1 per task
   flair-baseline build-data    --clif-config clif.json --out .   # ONE shared MEDS (ETL once)
   flair-baseline featurize     --clif-config clif.json --out .   # per-task features.npz + codes
-  flair-baseline train         --clif-config clif.json --out .   # fit 5 models (fixed vocab)
+  flair-baseline train         --clif-config clif.json --out .   # fit one model per task (fixed vocab)
   # — at a CLIF site, scope the data pull to the 25% holdout —
   flair-baseline build-data    … --holdout-only
   flair-baseline featurize     … --holdout-only
@@ -37,9 +37,10 @@ from typing import Optional
 import polars as pl
 import typer
 
-from flair_baseline.config import DEFAULT_ELF_CONFIG, resolve_task
-from flair_baseline.featurize import (compute_counts, counts_to_X, load_counts,
-                                      save_counts, truncated_code_map)
+from flair_baseline.config import DEFAULT_ELF_CONFIG, available_tasks, resolve_task
+from flair_baseline.featurize import (ROLE_COUNT, ROLE_ONEHOT, ROLE_STAT, STATS,
+                                      code_role, compute_counts, counts_to_X,
+                                      load_counts, save_counts, truncated_code_map)
 from flair_baseline.layout import SitePaths, TaskPaths, report_mode
 from flair_baseline.train import train_and_score
 
@@ -48,7 +49,7 @@ DEFAULT_VOCAB = "vocab.json"
 JOIN_ID = "hospitalization_join_id"
 
 app = typer.Typer(add_completion=False, no_args_is_help=True,
-                  help="XGBoost count-feature baseline for FLAIR tasks (staged pipeline)")
+                  help="XGBoost feature baseline for FLAIR tasks (staged pipeline)")
 
 
 # --------------------------------------------------------------------------- #
@@ -92,8 +93,7 @@ def _stitch(clif_config: str):
 
 
 def _resolve_tasks(task: Optional[str]) -> list[str]:
-    from flair_benchmark.tasks import list_tasks
-    return [resolve_task(task)] if task else list_tasks()
+    return [resolve_task(task)] if task else available_tasks()
 
 
 def _read_cohort(paths: TaskPaths, task_name: str, need: str) -> pl.DataFrame:
@@ -110,14 +110,21 @@ def _scope(cohort: pl.DataFrame, holdout_only: bool) -> pl.DataFrame:
     return cohort.filter(pl.col("split") == "test") if holdout_only else cohort
 
 
-def _load_vocab(vocab_path: str) -> list[str]:
+def _load_vocab(vocab_path: str) -> tuple[list[str], list[int]]:
+    """Read the committed vocabulary → (truncated codes, per-code roles).
+
+    ``roles`` is persisted for auditability but is recoverable from the code
+    strings alone (see ``featurize.code_role``), so a roles-less file still loads.
+    """
     p = Path(vocab_path)
     if not p.exists():
         typer.echo(f"fixed vocabulary not found at {p} — run `flair-baseline build-vocab` "
                    f"(maintainer) or point --vocab at the committed vocab.json", err=True)
         raise typer.Exit(1)
     data = json.loads(p.read_text())
-    return data["vocab"] if isinstance(data, dict) else list(data)
+    vocab = data["vocab"] if isinstance(data, dict) else list(data)
+    roles = data.get("roles") if isinstance(data, dict) else None
+    return vocab, (list(roles) if roles else [code_role(c) for c in vocab])
 
 
 # --------------------------------------------------------------------------- #
@@ -269,7 +276,7 @@ def _report(paths: TaskPaths, task_name: str, clif_config: str, preds: pl.DataFr
 def build_cohorts_cmd(
     clif_config: str = typer.Option(DEFAULT_CLIF_CONFIG, "--clif-config"),
     out: str = typer.Option(".", "--out"),
-    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = all 5"),
+    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = every task"),
     train_end: Optional[str] = typer.Option(None, "--train-end"),
     test_start: Optional[str] = typer.Option(None, "--test-start"),
 ) -> None:
@@ -284,7 +291,7 @@ def build_data_cmd(
     clif_config: str = typer.Option(DEFAULT_CLIF_CONFIG, "--clif-config"),
     elf_config: str = typer.Option(DEFAULT_ELF_CONFIG, "--elf-config"),
     out: str = typer.Option(".", "--out"),
-    task: Optional[str] = typer.Option(None, "--task", help="Default = union of all 5"),
+    task: Optional[str] = typer.Option(None, "--task", help="Default = union of every task"),
     holdout_only: bool = typer.Option(False, "--holdout-only/--full-cohort",
                                       help="Pull ETL for the 25%% test split only (inference sites)"),
     reuse: bool = typer.Option(False, "--reuse/--no-reuse",
@@ -304,11 +311,11 @@ def build_data_cmd(
 def featurize_cmd(
     clif_config: str = typer.Option(DEFAULT_CLIF_CONFIG, "--clif-config"),
     out: str = typer.Option(".", "--out"),
-    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = all 5"),
+    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = every task"),
     holdout_only: bool = typer.Option(False, "--holdout-only/--full-cohort",
                                       help="Featurize the 25%% test split only (inference sites)"),
 ) -> None:
-    """Count-featurize each task off the shared MEDS → features.npz + codes.parquet."""
+    """Featurize each task off the shared MEDS → features.npz + codes.parquet."""
     from flair_benchmark._clif import read_clif_config
     site = read_clif_config(clif_config).get("site")
     _do_featurize(clif_config, out, _resolve_tasks(task), site, holdout_only)
@@ -318,7 +325,7 @@ def featurize_cmd(
 def train_cmd(
     clif_config: str = typer.Option(DEFAULT_CLIF_CONFIG, "--clif-config"),
     out: str = typer.Option(".", "--out"),
-    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = all 5"),
+    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = every task"),
     vocab: str = typer.Option(DEFAULT_VOCAB, "--vocab",
                               help="Committed fixed feature vocabulary (vocab.json)"),
     report: bool = typer.Option(True, "--report/--no-report"),
@@ -331,7 +338,7 @@ def train_cmd(
     from flair_benchmark.tasks import get_task
 
     site = read_clif_config(clif_config).get("site")
-    fixed_vocab = _load_vocab(vocab)
+    fixed_vocab, fixed_roles = _load_vocab(vocab)
     n_trials = hpo_trials if hpo else 0
     tasks = _resolve_tasks(task)
     for i, t in enumerate(tasks, 1):
@@ -345,11 +352,13 @@ def train_cmd(
             typer.echo(f"[{t}] no matching features.npz — run `flair-baseline featurize` "
                        f"first", err=True)
             raise typer.Exit(1)
-        X, ids, _ = counts_to_X(counts, vocab=fixed_vocab)
-        typer.echo(f"[{t}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} ({X.nnz:,} nnz) "
+        X, ids, names = counts_to_X(counts, vocab=fixed_vocab, roles=fixed_roles)
+        typer.echo(f"[{t}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} "
+                   f"(+extras) from {len(fixed_vocab):,} codes "
                    f"— training XGBoost ({f'HPO {n_trials} trials' if n_trials else 'fixed params'})")
-        preds = train_and_score(X, ids, fixed_vocab, cohort, label_col,
+        preds = train_and_score(X, ids, names, cohort, label_col,
                                 model_out=str(paths.model), vocab_out=str(paths.vocab),
+                                vocab_meta={"vocab": fixed_vocab, "roles": fixed_roles},
                                 params_out=str(paths.params), n_trials=n_trials,
                                 time_since_first=counts.time_since_first)
         preds.write_parquet(paths.preds)
@@ -361,7 +370,7 @@ def infer_cmd(
     models_dir: str = typer.Option(..., "--models-dir"),
     clif_config: str = typer.Option(DEFAULT_CLIF_CONFIG, "--clif-config"),
     out: str = typer.Option(".", "--out"),
-    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = all 5"),
+    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = every task"),
     report: bool = typer.Option(True, "--report/--no-report"),
     viz: bool = typer.Option(True, "--viz/--no-viz"),
 ) -> None:
@@ -379,7 +388,10 @@ def infer_cmd(
         if not (model_path.exists() and vocab_path.exists()):
             typer.echo(f"[{t}] no model under {models_root / t} — skipping")
             continue
-        vocab_list = json.loads(vocab_path.read_text())["vocab"]
+        saved = json.loads(vocab_path.read_text())
+        vocab_list = saved["vocab"]
+        roles_list = (list(saved["roles"]) if saved.get("roles")
+                      else [code_role(c) for c in vocab_list])
         label_col = get_task(t).META["label_column"]
         paths = TaskPaths.make(out, site, t)
         paths.mkdirs()
@@ -389,10 +401,10 @@ def infer_cmd(
             typer.echo(f"[{t}] no matching features.npz — run `flair-baseline featurize "
                        f"--holdout-only` first", err=True)
             raise typer.Exit(1)
-        X, ids, _ = counts_to_X(counts, vocab=vocab_list)
-        typer.echo(f"[{t}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} ({X.nnz:,} nnz) "
+        X, ids, names = counts_to_X(counts, vocab=vocab_list, roles=roles_list)
+        typer.echo(f"[{t}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} (+extras) "
                    f"— scoring with shipped model")
-        preds = train_and_score(X, ids, vocab_list, score_cohort, label_col,
+        preds = train_and_score(X, ids, names, score_cohort, label_col,
                                 model_in=str(model_path),
                                 time_since_first=counts.time_since_first)
         preds.write_parquet(paths.preds)
@@ -416,9 +428,16 @@ def build_vocab_cmd(
                    err=True)
         raise typer.Exit(1)
     code_map = truncated_code_map(pl.scan_parquet(sp.meds_glob))
-    vocab = code_map.select("trunc").unique().sort("trunc")["trunc"].to_list()
-    Path(vocab_out).write_text(json.dumps({"vocab": vocab}, indent=2))
-    typer.echo(f"[build-vocab] {len(vocab):,} codes → {vocab_out}")
+    by_trunc = code_map.select("trunc", "role").unique().sort("trunc")
+    vocab = by_trunc["trunc"].to_list()
+    roles = [int(r) for r in by_trunc["role"].to_list()]
+    Path(vocab_out).write_text(json.dumps({"vocab": vocab, "roles": roles}, indent=2))
+    n_stat = sum(1 for r in roles if r == ROLE_STAT)
+    n_cnt = sum(1 for r in roles if r == ROLE_COUNT)
+    n_oh = sum(1 for r in roles if r == ROLE_ONEHOT)
+    typer.echo(f"[build-vocab] {len(vocab):,} codes "
+               f"({n_stat} stat × {len(STATS)} + {n_cnt} count + {n_oh} one-hot "
+               f"= {n_stat * len(STATS) + n_cnt + n_oh:,} features) → {vocab_out}")
 
 
 @app.command("prepare")
