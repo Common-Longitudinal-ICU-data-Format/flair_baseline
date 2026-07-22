@@ -21,17 +21,20 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from flair_benchmark._constants import TASK_POLICY
+from flair_benchmark.tasks import get_task
 
 
 def report_mode(task_name: str) -> str:
-    """Report mode for a task — single-sourced from flair_benchmark/_constants.py.
+    """Report mode for a task — read from the task module's own ``META``.
 
-    task1/task2 = landmark (per lead-time), episode tasks (3, 5) = episodic.
-    Anything unlisted defaults to episodic. The lookup stays generic, so a task
-    whose policy names another mode (e.g. peak) still routes correctly.
+    task1/task2 = continuous (per lead-time), episode tasks (3, 5) = episodic.
+    An unknown task (``get_task`` raises) defaults to episodic. The lookup stays
+    generic, so a task whose META names another mode still routes correctly.
     """
-    return TASK_POLICY.get(task_name, {}).get("report_mode", "episodic")
+    try:
+        return get_task(task_name).META.get("report_mode", "episodic")
+    except (ValueError, TypeError):
+        return "episodic"
 
 
 def slug(site: str | None) -> str:
