@@ -53,14 +53,14 @@ The expected folder layout is:
 
 ``` text
 mimic_baseline_models/
-  task1_icu_daily_mortality/model.json
-  task1_icu_daily_mortality/vocab.json
-  task2_icu_daily_ltach/model.json
-  task2_icu_daily_ltach/vocab.json
-  task3_extubation_failure_24h/model.json
-  task3_extubation_failure_24h/vocab.json
-  task5_icu_readmission/model.json
-  task5_icu_readmission/vocab.json
+  icu_daily_mortality/model.json
+  icu_daily_mortality/vocab.json
+  icu_daily_ltach/model.json
+  icu_daily_ltach/vocab.json
+  extubation_failure_24h/model.json
+  extubation_failure_24h/vocab.json
+  icu_readmission/model.json
+  icu_readmission/vocab.json
 ```
 
 ### 4. Run Inference
@@ -152,11 +152,11 @@ uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config con
 
 ### Run One Task Only
 
-Add `--task task1`, `--task task2`, `--task task3`, or `--task task5` to both commands.
+Add `--task icu_daily_mortality`, `--task icu_daily_ltach`, `--task extubation_failure_24h`, or `--task icu_readmission` to both commands.
 
 ``` bash
-uv run flair-baseline prepare --clif-config config/clif_config.json --out . --holdout-only --reuse --pmc --task task1
-uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config config/clif_config.json --out . --viz --task task1
+uv run flair-baseline prepare --clif-config config/clif_config.json --out . --holdout-only --reuse --pmc --task icu_daily_mortality
+uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config config/clif_config.json --out . --viz --task icu_daily_mortality
 ```
 
 ### Run The Stages Manually
@@ -189,10 +189,10 @@ At external sites, `--holdout-only` keeps the expensive ETL and featurization sc
 
 | Task    | Name                               | Report mode |
 |---------|------------------------------------|-------------|
-| `task1` | ICU daily in-hospital mortality    | Landmark    |
-| `task2` | ICU daily LTACH discharge          | Landmark    |
-| `task3` | Extubation failure within 24 hours | Episodic    |
-| `task5` | ICU readmission                    | Episodic    |
+| `icu_daily_mortality` | ICU daily in-hospital mortality    | Landmark    |
+| `icu_daily_ltach` | ICU daily LTACH discharge          | Landmark    |
+| `extubation_failure_24h` | Extubation failure within 24 hours | Episodic    |
+| `icu_readmission` | ICU readmission                    | Episodic    |
 
 Report modes:
 

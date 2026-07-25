@@ -54,7 +54,7 @@ flair-baseline train [--clif-config config/clif_config.json] [--elf-config flair
 | `--clif-config` | `config/clif_config.template.json` | `clif_config.json` (path, filetype, timezone, `site`). `site=mimic` ⇒ 75/25 split |
 | `--elf-config` | `flair_elf_config.yaml` | event concepts to extract (= the feature set) |
 | `--out` | `.` | root for the three `<site>_baseline_*` folders |
-| `--task` | all tasks | task name or prefix (`task1` → `task1_icu_daily_mortality`) |
+| `--task` | all tasks | task name or prefix (`extubation` → `extubation_failure_24h`) |
 | `--train-end` / `--test-start` | none | date cutoff for non-mimic sites (omit on mimic) |
 | `--report` / `--no-report` | report | build the FLAIR report bundle (mode per task; see §2⑤) |
 | `--viz` / `--no-viz` | no-viz | also render sanity-check PNGs into `report/viz/` |
@@ -65,7 +65,7 @@ flair-baseline train [--clif-config config/clif_config.json] [--elf-config flair
 uv run flair-baseline train --clif-config config/clif_config.json --out . --viz
 
 # one task
-uv run flair-baseline train --task task3 --clif-config config/clif_config.json --out .
+uv run flair-baseline train --task extubation_failure_24h --clif-config config/clif_config.json --out .
 ```
 
 ### `flair-baseline infer` (new site — only the models folder travels)
@@ -157,8 +157,8 @@ The **mode** (chosen per task by `flair_baseline/layout.py:report_mode`) sets ho
 
 | mode | tasks | files |
 |---|---|---|
-| **episodic** | task3, task5 | `discrimination.json`, `calibration.json`, `dca.json`, `fairness.json` |
-| **landmark** | task1, task2 | the four pillars **per lead-time landmark** + `leadtime.json` |
+| **episodic** | extubation_failure_24h, icu_readmission | `discrimination.json`, `calibration.json`, `dca.json`, `fairness.json` |
+| **landmark** | icu_daily_mortality, icu_daily_ltach | the four pillars **per lead-time landmark** + `leadtime.json` |
 | **peak** | _(none currently)_ | `discrimination.json` + `fairness.json` (+ NNE); calibration/DCA omitted (peak-calibration trap) |
 
 - **episodic** — one prediction per stay; the four pillars straight up.
@@ -230,27 +230,27 @@ lead-time) and add `leadtime.json`. A peak-mode task would omit `calibration.jso
 
 ## 5. Per-task breakdown (MIMIC-IV)
 
-### task1 — ICU Daily In-Hospital Mortality (7 AM)
+### icu_daily_mortality — ICU Daily In-Hospital Mortality (7 AM)
 
 - `label_mortality` · outcome · one-per-window (daily 07:00 grid) · threshold 0.95.
 - Cohort **198,125** rows (148,763 train / 49,362 test; 9,838 test positives).
 - MEDS events / codes per-domain: VITAL 44.999M, LAB 17.584M, RESP 11.726M, PA 8.282M, MED_CON 6.224M, MED_INT 2.681M, HOSP_DX 1.174M.
 - Features **198,125 × 433**, 14.66M nnz. **Test AUROC 0.790**. 9 PNGs (+ encounter lead_time / operating_curve). Encounter: 16,102 stays (2,135 event); at t=0.95 stay-sens 0.017, ctrl-alarm 0.001, NNA 3.58 — lead ≈0 (daily mortality label fires on the event day).
 
-### task2 — ICU Daily LTACH Discharge (7 AM)
+### icu_daily_ltach — ICU Daily LTACH Discharge (7 AM)
 
 - `label_ltach` · outcome · one-per-window (daily 07:00) · threshold 0.5.
-- Cohort **198,125** (148,763 / 49,362; 7,152 test pos). Same base ICU cohort + events as task1.
+- Cohort **198,125** (148,763 / 49,362; 7,152 test pos). Same base ICU cohort + events as icu_daily_mortality.
 - Features **198,125 × 433**, 14.66M nnz. **Test AUROC 0.757**. 9 PNGs (+ encounter).
 
-### task3 — Extubation failure within 24 h
+### extubation_failure_24h — Extubation failure within 24 h
 
 - `label_extubation_failure_24h` · intervention · one-per-stay (episode) · threshold 0.15.
 - Cohort **26,771** (20,077 / 6,694; 364 test pos).
 - MEDS **57,832,570** events / 13,543 codes.
 - Features **26,771 × 412**, 2.21M nnz. **Test AUROC 0.701**. 5 PNGs (one-per-stay → no window plots; `encounter.json` = `one_per_stay_task` stub, no lead-time/operating-curve PNGs).
 
-### task5 — Unplanned ICU Readmission
+### icu_readmission — Unplanned ICU Readmission
 
 - `label_icu_readmission` · outcome · one-per-stay (episode) · threshold 0.2.
 - Cohort **67,250** (50,436 / 16,814; 1,562 test pos).
@@ -261,12 +261,12 @@ lead-time) and add `leadtime.json`. A peak-mode task would omit `calibration.jso
 
 | task                         | test AUROC | features | n_test (pos)      |
 |------------------------------|-----------:|---------:|-------------------|
-| task1 ICU daily mortality    |  **0.790** |      433 | 49,362 (9,838)    |
-| task2 ICU daily LTACH        |  **0.757** |      433 | 49,362 (7,152)    |
-| task3 extubation failure 24h |  **0.701** |      412 | 6,694 (364)       |
-| task5 ICU readmission        |  **0.645** |      429 | 16,814 (1,562)    |
+| icu_daily_mortality    |  **0.790** |      433 | 49,362 (9,838)    |
+| icu_daily_ltach        |  **0.757** |      433 | 49,362 (7,152)    |
+| extubation_failure_24h |  **0.701** |      412 | 6,694 (364)       |
+| icu_readmission        |  **0.645** |      429 | 16,814 (1,562)    |
 
-Excluding HOSP_DX moved AUROC by ≤ 0.02 vs the leaky version — the post-hoc diagnoses were not real predictive signal, just leakage (and they had ballooned the vocab, e.g. task1 1,840 → 433).
+Excluding HOSP_DX moved AUROC by ≤ 0.02 vs the leaky version — the post-hoc diagnoses were not real predictive signal, just leakage (and they had ballooned the vocab, e.g. icu_daily_mortality 1,840 → 433).
 
 ------------------------------------------------------------------------
 
@@ -347,7 +347,7 @@ threshold) — enough for a coordinator to align and pool sites.
 
 ``` bash
 # copy a training site's models folder to this site, then:
-uv run flair-baseline infer --task task3 \
+uv run flair-baseline infer --task extubation_failure_24h \
   --models-dir mimic_baseline_models \
   --clif-config config/clif_config.json --out . --viz
 ```

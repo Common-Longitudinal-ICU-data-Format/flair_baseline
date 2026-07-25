@@ -6,10 +6,10 @@ from flair_benchmark.tasks import list_tasks
 DEFAULT_ELF_CONFIG = "flair_elf_config.yaml"
 
 # Tasks the baseline does not run, even though flair_benchmark still defines them.
-# The sepsis task (task4) is retired here: it is out of scope for this baseline, so
-# it is filtered out at the single choke point below rather than at each call site.
-# Removing an entry re-enables the task; no other code change is needed.
-EXCLUDED_TASKS = frozenset({"task4_sepsis_abx_6h"})
+# Empty today — the sepsis task it used to exclude was removed from flair_benchmark
+# upstream. Kept as the single choke point: add a task name here to hide it from the
+# CLI without touching each call site; removing it re-enables the task.
+EXCLUDED_TASKS = frozenset()
 
 
 def available_tasks() -> list[str]:
@@ -23,17 +23,16 @@ def available_tasks() -> list[str]:
 
 
 def resolve_task(name: str) -> str:
-    """Accept a full task name or a short prefix (e.g. 'task1') → full task name."""
+    """Accept a full task name or a short prefix (e.g. 'extubation') → full task name."""
     tasks = available_tasks()
     if name in tasks:
         return name
-    matches = [t for t in tasks if t == name or t.split("_")[0] == name or t.startswith(name)]
+    matches = [t for t in tasks if t == name or t.startswith(name)]
     if len(matches) == 1:
         return matches[0]
     if not matches:
         if name in EXCLUDED_TASKS or any(
-            t == name or t.split("_")[0] == name or t.startswith(name)
-            for t in EXCLUDED_TASKS
+            t == name or t.startswith(name) for t in EXCLUDED_TASKS
         ):
             raise ValueError(
                 f"Task {name!r} has been removed from this baseline. Available: {tasks}")

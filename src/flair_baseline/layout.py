@@ -27,7 +27,7 @@ from flair_benchmark.tasks import get_task
 def report_mode(task_name: str) -> str:
     """Report mode for a task — read from the task module's own ``META``.
 
-    task1/task2 = continuous (per lead-time), episode tasks (3, 5) = episodic.
+    Continuous tasks report per lead-time; episode tasks report episodic.
     An unknown task (``get_task`` raises) defaults to episodic. The lookup stays
     generic, so a task whose META names another mode still routes correctly.
     """
