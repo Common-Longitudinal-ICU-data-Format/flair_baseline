@@ -75,6 +75,15 @@ def _auroc(preds: pl.DataFrame, label_col: str, split: str) -> Optional[float]:
     return float(roc_auc_score(y, d["y_prob"].to_numpy()))
 
 
+def _headline_json(report_dir: Path, mode: str) -> Path:
+    """The report file carrying this mode's headline metrics.
+
+    Sole owner of the mode -> filename mapping, so the AUROC reader and the
+    "did the report actually get written?" check cannot drift apart.
+    """
+    return report_dir / ("landmark.json" if mode == "continuous" else "overall.json")
+
+
 def _report_auroc(report_dir: Path, mode: str) -> tuple[Optional[float], str]:
     """Headline AUROC out of the report bundle, keyed by report mode.
 
@@ -92,9 +101,9 @@ def _report_auroc(report_dir: Path, mode: str) -> tuple[Optional[float], str]:
     rather than raising: the benchmark legitimately emits null for a degenerate
     split (single label class, or a landmark under its min cell count).
     """
-    name, section, label = (("landmark", "pooled", " pooled") if mode == "continuous"
-                            else ("overall", "discrimination", ""))
-    f = report_dir / f"{name}.json"
+    section, label = (("pooled", " pooled") if mode == "continuous"
+                      else ("discrimination", ""))
+    f = _headline_json(report_dir, mode)
     if not f.exists():
         return None, label
     payload = json.loads(f.read_text()).get(section)
@@ -302,8 +311,22 @@ def _report(paths: TaskPaths, task_name: str, clif_config: str, preds: pl.DataFr
     from flair_benchmark.tasks import get_task
     site = read_clif_config(clif_config).get("site")
     mode = report_mode(task_name)
-    build_report(str(paths.preds), get_task(task_name), str(paths.report_dir),
-                 cohort_path=str(paths.cohort), viz=viz, site=site, mode=mode)
+    try:
+        build_report(str(paths.preds), get_task(task_name), str(paths.report_dir),
+                     cohort_path=str(paths.cohort), viz=viz, site=site, mode=mode)
+    except Exception as exc:
+        # build_report writes the report JSONs first, THEN renders PNGs. It guards
+        # the render with `except ImportError` only, so any other error in the
+        # plotting code escapes and would otherwise kill a run whose model, preds
+        # and metrics are already on disk. A figure is cosmetic; the metrics are
+        # not. So: if the headline JSON landed, the failure was in the viz stage —
+        # warn and carry on. If it didn't, report generation itself failed and the
+        # error is real, so re-raise.
+        if not _headline_json(paths.report_dir, mode).exists():
+            raise
+        typer.echo(f"[{task_name}] report JSONs written, but visualization failed "
+                   f"— continuing with an incomplete PNG set. "
+                   f"{type(exc).__name__}: {exc}", err=True)
     rep_auc, lbl = _report_auroc(paths.report_dir, mode)
     typer.echo(f"[{task_name}] report AUROC ({mode}{lbl}, test)={rep_auc}  "
                f"[row-level train={auc_tr} test={auc_te}]")

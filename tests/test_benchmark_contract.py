@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from flair_baseline.cli import _report_auroc
+from flair_baseline.cli import _headline_json, _report_auroc
 from flair_baseline.layout import report_mode
 
 from flair_baseline.config import available_tasks
@@ -103,3 +103,39 @@ def test_report_auroc_does_not_read_the_deleted_discrimination_json(tmp_path):
     for mode in ("episodic", "continuous"):
         auroc, _ = _report_auroc(tmp_path, mode)
         assert auroc is None
+
+
+# --------------------------------------------------------------------------- #
+# a plotting failure must not discard a finished run
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("mode,filename", [("episodic", "overall.json"),
+                                           ("continuous", "landmark.json")])
+def test_headline_json_matches_the_auroc_reader(tmp_path, mode, filename):
+    """The viz-tolerance check and the AUROC reader must agree on the filename.
+
+    If they drift, a viz failure either aborts a good run or masks a genuinely
+    missing report.
+    """
+    assert _headline_json(tmp_path, mode).name == filename
+    (tmp_path / filename).write_text(json.dumps(
+        {"discrimination": {"auroc": 0.5}, "pooled": {"auroc": 0.5}}))
+    assert _headline_json(tmp_path, mode).exists()
+    assert _report_auroc(tmp_path, mode)[0] == 0.5
+
+
+def test_sweep_band_filter_rejects_half_open_ci():
+    """flair_benchmark's threshold-sweep band must skip half-open CIs.
+
+    NNE is 1/PPV, so a PPV bound at zero yields nne_ci = [4.8, None]. A plain
+    truthiness test lets that reach matplotlib's fill_between, whose isfinite
+    raises TypeError — which killed every episodic task once matplotlib was
+    actually installed. Assert the numeric-endpoint guard is present upstream.
+    """
+    import inspect
+
+    from flair_benchmark.report import _viz
+
+    src = inspect.getsource(_viz._sweep_fig)
+    assert "isinstance" in src, (
+        "flair_benchmark.report._viz._sweep_fig no longer guards CI endpoints for "
+        "numeric type; a half-open CI like [4.8, None] will crash fill_between")

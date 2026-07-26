@@ -334,11 +334,11 @@ path in `pyproject.toml`.
 
 ### Rebuilding The Bundled Wheel
 
-Run this whenever `flair_benchmark` changes. **The version stays `0.0.1`, so the
-rebuilt wheel has an identical filename** — `uv` therefore sees an unchanged
-dependency spec and will serve its cached build unless you force a reinstall.
-Skipping the last step is how the bundled wheel silently fell a whole package
-reorganization behind:
+Run this whenever `flair_benchmark` changes. The version stays `0.0.1`, so the
+rebuilt wheel has an identical filename — but `uv.lock` records the wheel's
+**sha256**, so the new content will not install until the lock is refreshed. You
+will see a hard `Hash mismatch` error rather than a silent stale install, so do
+not skip the `uv lock` step:
 
 ``` bash
 # from the FLAIR repo root
@@ -347,9 +347,13 @@ uv build --wheel --out-dir flair_baseline/wheels
 rm -f flair_baseline/wheels/.gitignore   # uv writes one; the wheel MUST be committed
 
 # from flair_baseline/
+uv lock --upgrade-package flair-benchmark   # re-pin the new wheel hash
 uv sync --reinstall-package flair-benchmark
 uv run pytest                            # tests/test_benchmark_contract.py is the tripwire
 ```
+
+Commit `uv.lock` alongside the rebuilt wheel — the recorded hash is what makes a
+mismatched pair fail loudly instead of drifting.
 
 `tests/test_benchmark_contract.py` exists for exactly this moment. It asserts that
 every task's report mode is one the benchmark still accepts, and that the
