@@ -53,16 +53,14 @@ The expected folder layout is:
 
 ``` text
 mimic_baseline_models/
-  task1_icu_daily_mortality/model.json
-  task1_icu_daily_mortality/vocab.json
-  task2_icu_daily_ltach/model.json
-  task2_icu_daily_ltach/vocab.json
-  task3_extubation_failure_24h/model.json
-  task3_extubation_failure_24h/vocab.json
-  task4_sepsis_abx_6h/model.json
-  task4_sepsis_abx_6h/vocab.json
-  task5_icu_readmission/model.json
-  task5_icu_readmission/vocab.json
+  icu_daily_mortality/model.json
+  icu_daily_mortality/vocab.json
+  icu_daily_ltach/model.json
+  icu_daily_ltach/vocab.json
+  extubation_failure_24h/model.json
+  extubation_failure_24h/vocab.json
+  icu_readmission/model.json
+  icu_readmission/vocab.json
 ```
 
 ### 4. Run Inference
@@ -119,7 +117,9 @@ Quick upload check:
 ``` text
 <site>_baseline_non_phi_for_upload/<task>/codes.parquet
 <site>_baseline_non_phi_for_upload/<task>/table1.json
-<site>_baseline_non_phi_for_upload/<task>/report/*.json
+<site>_baseline_non_phi_for_upload/<task>/report/overall.json        # episodic tasks
+<site>_baseline_non_phi_for_upload/<task>/report/landmark.json       # continuous tasks
+<site>_baseline_non_phi_for_upload/<task>/report/hospitalization_level.json
 <site>_baseline_non_phi_for_upload/<task>/report/viz/*.png
 ```
 
@@ -154,11 +154,11 @@ uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config con
 
 ### Run One Task Only
 
-Add `--task task1`, `--task task2`, `--task task3`, `--task task4`, or `--task task5` to both commands.
+Add `--task icu_daily_mortality`, `--task icu_daily_ltach`, `--task extubation_failure_24h`, or `--task icu_readmission` to both commands.
 
 ``` bash
-uv run flair-baseline prepare --clif-config config/clif_config.json --out . --holdout-only --reuse --pmc --task task1
-uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config config/clif_config.json --out . --viz --task task1
+uv run flair-baseline prepare --clif-config config/clif_config.json --out . --holdout-only --reuse --pmc --task icu_daily_mortality
+uv run flair-baseline infer --models-dir mimic_baseline_models --clif-config config/clif_config.json --out . --viz --task icu_daily_mortality
 ```
 
 ### Run The Stages Manually
@@ -191,19 +191,32 @@ At external sites, `--holdout-only` keeps the expensive ETL and featurization sc
 
 | Task    | Name                               | Report mode |
 |---------|------------------------------------|-------------|
-| `task1` | ICU daily in-hospital mortality    | Landmark    |
-| `task2` | ICU daily LTACH discharge          | Landmark    |
-| `task3` | Extubation failure within 24 hours | Episodic    |
-| `task4` | Sepsis antibiotics within 6 hours  | Peak        |
-| `task5` | ICU readmission                    | Episodic    |
+| `icu_daily_mortality` | ICU daily in-hospital mortality    | Continuous  |
+| `icu_daily_ltach` | ICU daily LTACH discharge          | Continuous  |
+| `extubation_failure_24h` | Extubation failure within 24 hours | Episodic    |
+| `icu_readmission` | ICU readmission                    | Episodic    |
 
-Report modes:
+The report mode is not set here — each task declares it in its own `META`, and
+the baseline reads it from there. There are only two modes:
 
-`landmark` reports metrics at lead-time landmarks and includes `leadtime.json`.
+`continuous` scores multiple rows per stay, at lead-time landmarks. Its report
+carries a pooled cross-landmark aggregate plus the per-landmark curve behind it.
 
-`episodic` reports one prediction per stay.
+`episodic` scores one prediction per stay.
 
-`peak` evaluates each stay by peak risk and omits calibration and DCA because peak-risk calibration is not meaningful.
+Each task's report is two JSONs (report schema 4):
+
+| File | Mode | Contains |
+|------|------|----------|
+| `overall.json` | episodic | `discrimination` (AUROC/AUPRC + CIs), `calibration` |
+| `landmark.json` | continuous | `pooled`, `by_landmark` |
+| `hospitalization_level.json` | both | 99-threshold sweep, Youden, `fairness`, `net_benefit` |
+
+Every report JSON stamps `metadata.report_schema`, so a reader can tell which
+bundle shape it is looking at. Earlier bundles (schema 3) split these across
+`discrimination.json`, `calibration.json`, `dca.json`, `fairness.json`,
+`operating_points.json`, `kpi.json` and `leadtime.json`. No metric was dropped in
+the consolidation — it moved into the files above.
 
 ## Feature Inputs
 
@@ -306,20 +319,58 @@ uv run flair-baseline prepare --clif-config config/clif_config.json --out . --ho
 
 Use a larger `--batch-size` only if the machine has enough memory.
 
-You can also run one task at a time with `--task taskN`.
+You can also run one task at a time with `--task <task_name>`, using any name from
+the Tasks table above. A unique prefix works too, so `--task icu_read` resolves to
+`icu_readmission`.
 
 ## Development Notes
 
-The FLAIR benchmark library is bundled as a wheel under `wheels/` and pinned in `pyproject.toml`.
+The baseline has its **own** uv environment. Run `uv sync` from this directory
+(not from the parent FLAIR repo) — that creates `flair_baseline/.venv`, and
+`uv run` uses it automatically.
 
-Maintainers updating the bundled library should rebuild the wheel, refresh the lockfile if needed, and reinstall the package:
+The FLAIR benchmark library is bundled as a wheel under `wheels/` and pinned by
+path in `pyproject.toml`.
+
+### Rebuilding The Bundled Wheel
+
+Run this whenever `flair_benchmark` changes. The version stays `0.0.1`, so the
+rebuilt wheel has an identical filename — but `uv.lock` records the wheel's
+**sha256**, so the new content will not install until the lock is refreshed. You
+will see a hard `Hash mismatch` error rather than a silent stale install, so do
+not skip the `uv lock` step:
 
 ``` bash
+# from the FLAIR repo root
+rm -f flair_baseline/wheels/*.whl
 uv build --wheel --out-dir flair_baseline/wheels
-rm -f flair_baseline/wheels/.gitignore
-rm uv.lock
-uv lock
+rm -f flair_baseline/wheels/.gitignore   # uv writes one; the wheel MUST be committed
+
+# from flair_baseline/
+uv lock --upgrade-package flair-benchmark   # re-pin the new wheel hash
 uv sync --reinstall-package flair-benchmark
+uv run pytest                            # tests/test_benchmark_contract.py is the tripwire
 ```
 
-If the package version or wheel filename changes, update `[tool.uv.sources]` in `pyproject.toml`.
+Commit `uv.lock` alongside the rebuilt wheel — the recorded hash is what makes a
+mismatched pair fail loudly instead of drifting.
+
+`tests/test_benchmark_contract.py` exists for exactly this moment. It asserts that
+every task's report mode is one the benchmark still accepts, and that the
+headline-AUROC reader matches the current report bundle — so an incompatible
+rebuild fails in seconds instead of hours into a training run.
+
+If the package version or wheel filename ever does change, update
+`[tool.uv.sources]` in `pyproject.toml` to match.
+
+### After A Benchmark Upgrade, Do Not Reuse The Shared MEDS
+
+`build-data --reuse` decides whether to skip the ETL by hashing its *inputs*
+(cohort membership, ELF domains, scope, batch size). It does **not** fingerprint
+the benchmark version, so a store built by an older library looks reusable even
+when its schema has changed — and the count join would then match zero rows
+without raising.
+
+After rebuilding the wheel, delete `<site>_baseline_phi/_shared/` and re-run
+`build-data` without `--reuse`. `featurize` will refuse to write an all-zero
+feature matrix if you forget, but starting clean is cheaper than diagnosing it.

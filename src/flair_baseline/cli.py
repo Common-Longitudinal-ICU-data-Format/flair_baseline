@@ -2,10 +2,10 @@
 
 Pipeline is split into stages you run in sequence (no per-task ETL re-runs):
 
-  flair-baseline build-cohorts --clif-config clif.json --out .   # 5 cohort.parquet + table1
+  flair-baseline build-cohorts --clif-config clif.json --out .   # one cohort.parquet + table1 per task
   flair-baseline build-data    --clif-config clif.json --out .   # ONE shared MEDS (ETL once)
   flair-baseline featurize     --clif-config clif.json --out .   # per-task features.npz + codes
-  flair-baseline train         --clif-config clif.json --out .   # fit 5 models (fixed vocab)
+  flair-baseline train         --clif-config clif.json --out .   # fit one model per task (fixed vocab)
   # — at a CLIF site, scope the data pull to the 25% holdout —
   flair-baseline build-data    … --holdout-only
   flair-baseline featurize     … --holdout-only
@@ -37,9 +37,19 @@ from typing import Optional
 import polars as pl
 import typer
 
-from flair_baseline.config import DEFAULT_ELF_CONFIG, resolve_task
-from flair_baseline.featurize import (compute_counts, counts_to_X, load_counts,
-                                      save_counts, truncated_code_map)
+from flair_baseline.config import DEFAULT_ELF_CONFIG, available_tasks, resolve_task
+from flair_baseline.featurize import (
+    ROLE_COUNT,
+    ROLE_ONEHOT,
+    ROLE_STAT,
+    STATS,
+    code_role,
+    compute_counts,
+    counts_to_X,
+    load_counts,
+    save_counts,
+    truncated_code_map,
+)
 from flair_baseline.layout import SitePaths, TaskPaths, report_mode
 from flair_baseline.train import train_and_score
 
@@ -48,7 +58,7 @@ DEFAULT_VOCAB = "vocab.json"
 JOIN_ID = "hospitalization_join_id"
 
 app = typer.Typer(add_completion=False, no_args_is_help=True,
-                  help="XGBoost count-feature baseline for FLAIR tasks (staged pipeline)")
+                  help="XGBoost feature baseline for FLAIR tasks (staged pipeline)")
 
 
 # --------------------------------------------------------------------------- #
@@ -65,24 +75,47 @@ def _auroc(preds: pl.DataFrame, label_col: str, split: str) -> Optional[float]:
     return float(roc_auc_score(y, d["y_prob"].to_numpy()))
 
 
-def _report_auroc(report_dir: Path) -> tuple:
-    """Headline AUROC from discrimination.json, matching the report mode."""
-    f = report_dir / "discrimination.json"
+def _headline_json(report_dir: Path, mode: str) -> Path:
+    """The report file carrying this mode's headline metrics.
+
+    Sole owner of the mode -> filename mapping, so the AUROC reader and the
+    "did the report actually get written?" check cannot drift apart.
+    """
+    return report_dir / ("landmark.json" if mode == "continuous" else "overall.json")
+
+
+def _report_auroc(report_dir: Path, mode: str) -> tuple[Optional[float], str]:
+    """Headline AUROC out of the report bundle, keyed by report mode.
+
+    Report schema 4 consolidated the bundle to two files per task, so the old
+    `discrimination.json` (and its `metrics` / `landmarks` keys) no longer exist:
+
+      episodic   -> overall.json  : discrimination.auroc
+      continuous -> landmark.json : pooled.auroc
+
+    For continuous tasks this is the benchmark's own pair-weighted
+    cross-landmark aggregate, NOT the lead-0 landmark the previous schema
+    reported — the two are not comparable across the schema change.
+
+    Returns (auroc, label_suffix). A missing file or a null metric yields None
+    rather than raising: the benchmark legitimately emits null for a degenerate
+    split (single label class, or a landmark under its min cell count).
+    """
+    section, label = (("pooled", " pooled") if mode == "continuous"
+                      else ("discrimination", ""))
+    f = _headline_json(report_dir, mode)
     if not f.exists():
-        return None, ""
-    d = json.loads(f.read_text())
-    if isinstance(d.get("metrics"), dict):
-        return d["metrics"].get("auroc"), ""
-    lms = d.get("landmarks") or []
-    if lms and isinstance(lms[0].get("metrics"), dict):
-        return lms[0]["metrics"].get("auroc"), " lead-0"
-    return None, ""
+        return None, label
+    payload = json.loads(f.read_text()).get(section)
+    if not isinstance(payload, dict):
+        return None, label
+    return payload.get("auroc"), label
 
 
 def _stitch(clif_config: str):
     """Build/load the encounter index once; return (clif cfg dict, index frame)."""
-    from flair_benchmark._clif import read_clif_config
-    from flair_benchmark._stitch import load_or_build_encounter_index
+    from flair_benchmark.cohort.clif import read_clif_config
+    from flair_benchmark.cohort.stitch import load_or_build_encounter_index
     cfg = read_clif_config(clif_config)
     idx = load_or_build_encounter_index(cfg, cfg.get("stitch_time_interval_hours", 6))
     n_blocks = idx[JOIN_ID].n_unique()
@@ -92,8 +125,7 @@ def _stitch(clif_config: str):
 
 
 def _resolve_tasks(task: Optional[str]) -> list[str]:
-    from flair_benchmark.tasks import list_tasks
-    return [resolve_task(task)] if task else list_tasks()
+    return [resolve_task(task)] if task else available_tasks()
 
 
 def _read_cohort(paths: TaskPaths, task_name: str, need: str) -> pl.DataFrame:
@@ -110,14 +142,21 @@ def _scope(cohort: pl.DataFrame, holdout_only: bool) -> pl.DataFrame:
     return cohort.filter(pl.col("split") == "test") if holdout_only else cohort
 
 
-def _load_vocab(vocab_path: str) -> list[str]:
+def _load_vocab(vocab_path: str) -> tuple[list[str], list[int]]:
+    """Read the committed vocabulary → (truncated codes, per-code roles).
+
+    ``roles`` is persisted for auditability but is recoverable from the code
+    strings alone (see ``featurize.code_role``), so a roles-less file still loads.
+    """
     p = Path(vocab_path)
     if not p.exists():
         typer.echo(f"fixed vocabulary not found at {p} — run `flair-baseline build-vocab` "
                    f"(maintainer) or point --vocab at the committed vocab.json", err=True)
         raise typer.Exit(1)
     data = json.loads(p.read_text())
-    return data["vocab"] if isinstance(data, dict) else list(data)
+    vocab = data["vocab"] if isinstance(data, dict) else list(data)
+    roles = data.get("roles") if isinstance(data, dict) else None
+    return vocab, (list(roles) if roles else [code_role(c) for c in vocab])
 
 
 # --------------------------------------------------------------------------- #
@@ -125,8 +164,8 @@ def _load_vocab(vocab_path: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 def _do_build_cohorts(clif_config: str, out: str, tasks: list[str], site: str,
                       train_end: Optional[str], test_start: Optional[str]) -> None:
-    from flair_benchmark._clif import read_clif_config
-    from flair_benchmark._table1 import generate_table1
+    from flair_benchmark.cohort.clif import read_clif_config
+    from flair_benchmark.cohort.table1 import generate_table1
     from flair_benchmark.tasks import get_task
 
     for i, t in enumerate(tasks, 1):
@@ -162,9 +201,9 @@ def _manifest_key(join_ids: list[str], elf_cfg: dict, holdout_only: bool,
 def _do_build_data(clif_config: str, elf_config: str, out: str, tasks: list[str],
                    site: str, idx: pl.DataFrame, holdout_only: bool, reuse: bool,
                    batch_size: Optional[int]) -> None:
-    from flair_benchmark._clif import read_clif_config
-    from flair_benchmark._stitch import members_of_joins
-    from flair_benchmark.features.fe_meds import build_shared_meds, load_elf_config
+    from flair_benchmark.cohort.clif import read_clif_config
+    from flair_benchmark.cohort.stitch import members_of_joins
+    from flair_benchmark.features.extractors import build_shared_meds, load_elf_config
 
     sp = SitePaths.make(out, site)
     sp.mkdirs()
@@ -227,6 +266,24 @@ def _do_featurize(clif_config: str, out: str, tasks: list[str], site: str,
                    .filter(pl.col(JOIN_ID).is_in(joins)))
 
         counts = compute_counts(ev_task, score_cohort, desc=f"[{t}] featurize")
+
+        # Fail loudly on an all-zero feature matrix. The count join is on
+        # hospitalization_join_id, and polars returns ZERO ROWS (not an error) when
+        # the two sides disagree on dtype — so a mismatched shared MEDS store would
+        # otherwise train happily on nothing and report an AUROC around 0.5.
+        nnz = len(counts.rr) + (0 if counts.srr is None else len(counts.srr))
+        if nnz == 0:
+            typer.echo(
+                f"[{t}] featurization matched ZERO events for {counts.n_rows:,} "
+                f"prediction rows — refusing to write an all-zero feature matrix.\n"
+                f"  The shared MEDS at {sp.meds_dir} does not join to this cohort on "
+                f"{JOIN_ID}.\n"
+                f"  Most likely it was built by a different flair-benchmark version "
+                f"(the manifest key does not fingerprint the library version).\n"
+                f"  Fix: delete {sp.shared_root} and re-run `flair-baseline "
+                f"build-data` with --no-reuse.", err=True)
+            raise typer.Exit(1)
+
         save_counts(paths.features, counts)
         typer.echo(f"[{t}] features → {paths.features} "
                    f"({counts.n_rows:,} rows, {len(counts.trunc_by_cint):,} codes)")
@@ -244,7 +301,7 @@ def _do_featurize(clif_config: str, out: str, tasks: list[str], site: str,
 # --------------------------------------------------------------------------- #
 def _report(paths: TaskPaths, task_name: str, clif_config: str, preds: pl.DataFrame,
             label_col: str, report: bool, viz: bool) -> None:
-    from flair_benchmark._clif import read_clif_config
+    from flair_benchmark.cohort.clif import read_clif_config
 
     auc_tr, auc_te = _auroc(preds, label_col, "train"), _auroc(preds, label_col, "test")
     if not report:
@@ -254,9 +311,23 @@ def _report(paths: TaskPaths, task_name: str, clif_config: str, preds: pl.DataFr
     from flair_benchmark.tasks import get_task
     site = read_clif_config(clif_config).get("site")
     mode = report_mode(task_name)
-    build_report(str(paths.preds), get_task(task_name), str(paths.report_dir),
-                 cohort_path=str(paths.cohort), viz=viz, site=site, mode=mode)
-    rep_auc, lbl = _report_auroc(paths.report_dir)
+    try:
+        build_report(str(paths.preds), get_task(task_name), str(paths.report_dir),
+                     cohort_path=str(paths.cohort), viz=viz, site=site, mode=mode)
+    except Exception as exc:
+        # build_report writes the report JSONs first, THEN renders PNGs. It guards
+        # the render with `except ImportError` only, so any other error in the
+        # plotting code escapes and would otherwise kill a run whose model, preds
+        # and metrics are already on disk. A figure is cosmetic; the metrics are
+        # not. So: if the headline JSON landed, the failure was in the viz stage —
+        # warn and carry on. If it didn't, report generation itself failed and the
+        # error is real, so re-raise.
+        if not _headline_json(paths.report_dir, mode).exists():
+            raise
+        typer.echo(f"[{task_name}] report JSONs written, but visualization failed "
+                   f"— continuing with an incomplete PNG set. "
+                   f"{type(exc).__name__}: {exc}", err=True)
+    rep_auc, lbl = _report_auroc(paths.report_dir, mode)
     typer.echo(f"[{task_name}] report AUROC ({mode}{lbl}, test)={rep_auc}  "
                f"[row-level train={auc_tr} test={auc_te}]")
     typer.echo(f"[{task_name}] report ({mode}){' + viz' if viz else ''} → {paths.report_dir}")
@@ -269,7 +340,7 @@ def _report(paths: TaskPaths, task_name: str, clif_config: str, preds: pl.DataFr
 def build_cohorts_cmd(
     clif_config: str = typer.Option(DEFAULT_CLIF_CONFIG, "--clif-config"),
     out: str = typer.Option(".", "--out"),
-    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = all 5"),
+    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = every task"),
     train_end: Optional[str] = typer.Option(None, "--train-end"),
     test_start: Optional[str] = typer.Option(None, "--test-start"),
 ) -> None:
@@ -284,7 +355,7 @@ def build_data_cmd(
     clif_config: str = typer.Option(DEFAULT_CLIF_CONFIG, "--clif-config"),
     elf_config: str = typer.Option(DEFAULT_ELF_CONFIG, "--elf-config"),
     out: str = typer.Option(".", "--out"),
-    task: Optional[str] = typer.Option(None, "--task", help="Default = union of all 5"),
+    task: Optional[str] = typer.Option(None, "--task", help="Default = union of every task"),
     holdout_only: bool = typer.Option(False, "--holdout-only/--full-cohort",
                                       help="Pull ETL for the 25%% test split only (inference sites)"),
     reuse: bool = typer.Option(False, "--reuse/--no-reuse",
@@ -304,12 +375,12 @@ def build_data_cmd(
 def featurize_cmd(
     clif_config: str = typer.Option(DEFAULT_CLIF_CONFIG, "--clif-config"),
     out: str = typer.Option(".", "--out"),
-    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = all 5"),
+    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = every task"),
     holdout_only: bool = typer.Option(False, "--holdout-only/--full-cohort",
                                       help="Featurize the 25%% test split only (inference sites)"),
 ) -> None:
-    """Count-featurize each task off the shared MEDS → features.npz + codes.parquet."""
-    from flair_benchmark._clif import read_clif_config
+    """Featurize each task off the shared MEDS → features.npz + codes.parquet."""
+    from flair_benchmark.cohort.clif import read_clif_config
     site = read_clif_config(clif_config).get("site")
     _do_featurize(clif_config, out, _resolve_tasks(task), site, holdout_only)
 
@@ -318,7 +389,7 @@ def featurize_cmd(
 def train_cmd(
     clif_config: str = typer.Option(DEFAULT_CLIF_CONFIG, "--clif-config"),
     out: str = typer.Option(".", "--out"),
-    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = all 5"),
+    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = every task"),
     vocab: str = typer.Option(DEFAULT_VOCAB, "--vocab",
                               help="Committed fixed feature vocabulary (vocab.json)"),
     report: bool = typer.Option(True, "--report/--no-report"),
@@ -327,11 +398,11 @@ def train_cmd(
     hpo_trials: int = typer.Option(30, "--hpo-trials"),
 ) -> None:
     """Fit XGBoost per task on prepared features (fixed vocab); models land in <site>_baseline_models/."""
-    from flair_benchmark._clif import read_clif_config
+    from flair_benchmark.cohort.clif import read_clif_config
     from flair_benchmark.tasks import get_task
 
     site = read_clif_config(clif_config).get("site")
-    fixed_vocab = _load_vocab(vocab)
+    fixed_vocab, fixed_roles = _load_vocab(vocab)
     n_trials = hpo_trials if hpo else 0
     tasks = _resolve_tasks(task)
     for i, t in enumerate(tasks, 1):
@@ -345,12 +416,15 @@ def train_cmd(
             typer.echo(f"[{t}] no matching features.npz — run `flair-baseline featurize` "
                        f"first", err=True)
             raise typer.Exit(1)
-        X, ids, _ = counts_to_X(counts, vocab=fixed_vocab)
-        typer.echo(f"[{t}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} ({X.nnz:,} nnz) "
+        X, ids, names = counts_to_X(counts, vocab=fixed_vocab, roles=fixed_roles)
+        typer.echo(f"[{t}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} "
+                   f"(+extras) from {len(fixed_vocab):,} codes "
                    f"— training XGBoost ({f'HPO {n_trials} trials' if n_trials else 'fixed params'})")
-        preds = train_and_score(X, ids, fixed_vocab, cohort, label_col,
+        preds = train_and_score(X, ids, names, cohort, label_col,
                                 model_out=str(paths.model), vocab_out=str(paths.vocab),
-                                params_out=str(paths.params), n_trials=n_trials)
+                                vocab_meta={"vocab": fixed_vocab, "roles": fixed_roles},
+                                params_out=str(paths.params), n_trials=n_trials,
+                                time_since_first=counts.time_since_first)
         preds.write_parquet(paths.preds)
         _report(paths, t, clif_config, preds, label_col, report, viz)
 
@@ -360,12 +434,12 @@ def infer_cmd(
     models_dir: str = typer.Option(..., "--models-dir"),
     clif_config: str = typer.Option(DEFAULT_CLIF_CONFIG, "--clif-config"),
     out: str = typer.Option(".", "--out"),
-    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = all 5"),
+    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = every task"),
     report: bool = typer.Option(True, "--report/--no-report"),
     viz: bool = typer.Option(True, "--viz/--no-viz"),
 ) -> None:
     """Score shipped models on this site's prepared (holdout) features; report on the 25% test split."""
-    from flair_benchmark._clif import read_clif_config
+    from flair_benchmark.cohort.clif import read_clif_config
     from flair_benchmark.tasks import get_task
 
     site = read_clif_config(clif_config).get("site")
@@ -378,7 +452,10 @@ def infer_cmd(
         if not (model_path.exists() and vocab_path.exists()):
             typer.echo(f"[{t}] no model under {models_root / t} — skipping")
             continue
-        vocab_list = json.loads(vocab_path.read_text())["vocab"]
+        saved = json.loads(vocab_path.read_text())
+        vocab_list = saved["vocab"]
+        roles_list = (list(saved["roles"]) if saved.get("roles")
+                      else [code_role(c) for c in vocab_list])
         label_col = get_task(t).META["label_column"]
         paths = TaskPaths.make(out, site, t)
         paths.mkdirs()
@@ -388,11 +465,12 @@ def infer_cmd(
             typer.echo(f"[{t}] no matching features.npz — run `flair-baseline featurize "
                        f"--holdout-only` first", err=True)
             raise typer.Exit(1)
-        X, ids, _ = counts_to_X(counts, vocab=vocab_list)
-        typer.echo(f"[{t}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} ({X.nnz:,} nnz) "
+        X, ids, names = counts_to_X(counts, vocab=vocab_list, roles=roles_list)
+        typer.echo(f"[{t}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} (+extras) "
                    f"— scoring with shipped model")
-        preds = train_and_score(X, ids, vocab_list, score_cohort, label_col,
-                                model_in=str(model_path))
+        preds = train_and_score(X, ids, names, score_cohort, label_col,
+                                model_in=str(model_path),
+                                time_since_first=counts.time_since_first)
         preds.write_parquet(paths.preds)
         _report(paths, t, clif_config, preds, label_col, report, viz)
 
@@ -405,7 +483,7 @@ def build_vocab_cmd(
                                   help="Where to write the committed fixed vocabulary"),
 ) -> None:
     """Regenerate the fixed feature vocabulary from the shared MEDS (maintainer, once)."""
-    from flair_benchmark._clif import read_clif_config
+    from flair_benchmark.cohort.clif import read_clif_config
 
     site = read_clif_config(clif_config).get("site")
     sp = SitePaths.make(out, site)
@@ -414,9 +492,16 @@ def build_vocab_cmd(
                    err=True)
         raise typer.Exit(1)
     code_map = truncated_code_map(pl.scan_parquet(sp.meds_glob))
-    vocab = code_map.select("trunc").unique().sort("trunc")["trunc"].to_list()
-    Path(vocab_out).write_text(json.dumps({"vocab": vocab}, indent=2))
-    typer.echo(f"[build-vocab] {len(vocab):,} codes → {vocab_out}")
+    by_trunc = code_map.select("trunc", "role").unique().sort("trunc")
+    vocab = by_trunc["trunc"].to_list()
+    roles = [int(r) for r in by_trunc["role"].to_list()]
+    Path(vocab_out).write_text(json.dumps({"vocab": vocab, "roles": roles}, indent=2))
+    n_stat = sum(1 for r in roles if r == ROLE_STAT)
+    n_cnt = sum(1 for r in roles if r == ROLE_COUNT)
+    n_oh = sum(1 for r in roles if r == ROLE_ONEHOT)
+    typer.echo(f"[build-vocab] {len(vocab):,} codes "
+               f"({n_stat} stat × {len(STATS)} + {n_cnt} count + {n_oh} one-hot "
+               f"= {n_stat * len(STATS) + n_cnt + n_oh:,} features) → {vocab_out}")
 
 
 @app.command("prepare")
