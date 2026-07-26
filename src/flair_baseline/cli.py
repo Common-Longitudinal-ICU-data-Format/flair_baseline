@@ -38,9 +38,18 @@ import polars as pl
 import typer
 
 from flair_baseline.config import DEFAULT_ELF_CONFIG, available_tasks, resolve_task
-from flair_baseline.featurize import (ROLE_COUNT, ROLE_ONEHOT, ROLE_STAT, STATS,
-                                      code_role, compute_counts, counts_to_X,
-                                      load_counts, save_counts, truncated_code_map)
+from flair_baseline.featurize import (
+    ROLE_COUNT,
+    ROLE_ONEHOT,
+    ROLE_STAT,
+    STATS,
+    code_role,
+    compute_counts,
+    counts_to_X,
+    load_counts,
+    save_counts,
+    truncated_code_map,
+)
 from flair_baseline.layout import SitePaths, TaskPaths, report_mode
 from flair_baseline.train import train_and_score
 
@@ -66,24 +75,38 @@ def _auroc(preds: pl.DataFrame, label_col: str, split: str) -> Optional[float]:
     return float(roc_auc_score(y, d["y_prob"].to_numpy()))
 
 
-def _report_auroc(report_dir: Path) -> tuple:
-    """Headline AUROC from discrimination.json, matching the report mode."""
-    f = report_dir / "discrimination.json"
+def _report_auroc(report_dir: Path, mode: str) -> tuple[Optional[float], str]:
+    """Headline AUROC out of the report bundle, keyed by report mode.
+
+    Report schema 4 consolidated the bundle to two files per task, so the old
+    `discrimination.json` (and its `metrics` / `landmarks` keys) no longer exist:
+
+      episodic   -> overall.json  : discrimination.auroc
+      continuous -> landmark.json : pooled.auroc
+
+    For continuous tasks this is the benchmark's own pair-weighted
+    cross-landmark aggregate, NOT the lead-0 landmark the previous schema
+    reported — the two are not comparable across the schema change.
+
+    Returns (auroc, label_suffix). A missing file or a null metric yields None
+    rather than raising: the benchmark legitimately emits null for a degenerate
+    split (single label class, or a landmark under its min cell count).
+    """
+    name, section, label = (("landmark", "pooled", " pooled") if mode == "continuous"
+                            else ("overall", "discrimination", ""))
+    f = report_dir / f"{name}.json"
     if not f.exists():
-        return None, ""
-    d = json.loads(f.read_text())
-    if isinstance(d.get("metrics"), dict):
-        return d["metrics"].get("auroc"), ""
-    lms = d.get("landmarks") or []
-    if lms and isinstance(lms[0].get("metrics"), dict):
-        return lms[0]["metrics"].get("auroc"), " lead-0"
-    return None, ""
+        return None, label
+    payload = json.loads(f.read_text()).get(section)
+    if not isinstance(payload, dict):
+        return None, label
+    return payload.get("auroc"), label
 
 
 def _stitch(clif_config: str):
     """Build/load the encounter index once; return (clif cfg dict, index frame)."""
-    from flair_benchmark._clif import read_clif_config
-    from flair_benchmark._stitch import load_or_build_encounter_index
+    from flair_benchmark.cohort.clif import read_clif_config
+    from flair_benchmark.cohort.stitch import load_or_build_encounter_index
     cfg = read_clif_config(clif_config)
     idx = load_or_build_encounter_index(cfg, cfg.get("stitch_time_interval_hours", 6))
     n_blocks = idx[JOIN_ID].n_unique()
@@ -132,8 +155,8 @@ def _load_vocab(vocab_path: str) -> tuple[list[str], list[int]]:
 # --------------------------------------------------------------------------- #
 def _do_build_cohorts(clif_config: str, out: str, tasks: list[str], site: str,
                       train_end: Optional[str], test_start: Optional[str]) -> None:
-    from flair_benchmark._clif import read_clif_config
-    from flair_benchmark._table1 import generate_table1
+    from flair_benchmark.cohort.clif import read_clif_config
+    from flair_benchmark.cohort.table1 import generate_table1
     from flair_benchmark.tasks import get_task
 
     for i, t in enumerate(tasks, 1):
@@ -169,9 +192,9 @@ def _manifest_key(join_ids: list[str], elf_cfg: dict, holdout_only: bool,
 def _do_build_data(clif_config: str, elf_config: str, out: str, tasks: list[str],
                    site: str, idx: pl.DataFrame, holdout_only: bool, reuse: bool,
                    batch_size: Optional[int]) -> None:
-    from flair_benchmark._clif import read_clif_config
-    from flair_benchmark._stitch import members_of_joins
-    from flair_benchmark.features.fe_meds import build_shared_meds, load_elf_config
+    from flair_benchmark.cohort.clif import read_clif_config
+    from flair_benchmark.cohort.stitch import members_of_joins
+    from flair_benchmark.features.extractors import build_shared_meds, load_elf_config
 
     sp = SitePaths.make(out, site)
     sp.mkdirs()
@@ -234,6 +257,24 @@ def _do_featurize(clif_config: str, out: str, tasks: list[str], site: str,
                    .filter(pl.col(JOIN_ID).is_in(joins)))
 
         counts = compute_counts(ev_task, score_cohort, desc=f"[{t}] featurize")
+
+        # Fail loudly on an all-zero feature matrix. The count join is on
+        # hospitalization_join_id, and polars returns ZERO ROWS (not an error) when
+        # the two sides disagree on dtype — so a mismatched shared MEDS store would
+        # otherwise train happily on nothing and report an AUROC around 0.5.
+        nnz = len(counts.rr) + (0 if counts.srr is None else len(counts.srr))
+        if nnz == 0:
+            typer.echo(
+                f"[{t}] featurization matched ZERO events for {counts.n_rows:,} "
+                f"prediction rows — refusing to write an all-zero feature matrix.\n"
+                f"  The shared MEDS at {sp.meds_dir} does not join to this cohort on "
+                f"{JOIN_ID}.\n"
+                f"  Most likely it was built by a different flair-benchmark version "
+                f"(the manifest key does not fingerprint the library version).\n"
+                f"  Fix: delete {sp.shared_root} and re-run `flair-baseline "
+                f"build-data` with --no-reuse.", err=True)
+            raise typer.Exit(1)
+
         save_counts(paths.features, counts)
         typer.echo(f"[{t}] features → {paths.features} "
                    f"({counts.n_rows:,} rows, {len(counts.trunc_by_cint):,} codes)")
@@ -251,7 +292,7 @@ def _do_featurize(clif_config: str, out: str, tasks: list[str], site: str,
 # --------------------------------------------------------------------------- #
 def _report(paths: TaskPaths, task_name: str, clif_config: str, preds: pl.DataFrame,
             label_col: str, report: bool, viz: bool) -> None:
-    from flair_benchmark._clif import read_clif_config
+    from flair_benchmark.cohort.clif import read_clif_config
 
     auc_tr, auc_te = _auroc(preds, label_col, "train"), _auroc(preds, label_col, "test")
     if not report:
@@ -263,7 +304,7 @@ def _report(paths: TaskPaths, task_name: str, clif_config: str, preds: pl.DataFr
     mode = report_mode(task_name)
     build_report(str(paths.preds), get_task(task_name), str(paths.report_dir),
                  cohort_path=str(paths.cohort), viz=viz, site=site, mode=mode)
-    rep_auc, lbl = _report_auroc(paths.report_dir)
+    rep_auc, lbl = _report_auroc(paths.report_dir, mode)
     typer.echo(f"[{task_name}] report AUROC ({mode}{lbl}, test)={rep_auc}  "
                f"[row-level train={auc_tr} test={auc_te}]")
     typer.echo(f"[{task_name}] report ({mode}){' + viz' if viz else ''} → {paths.report_dir}")
@@ -316,7 +357,7 @@ def featurize_cmd(
                                       help="Featurize the 25%% test split only (inference sites)"),
 ) -> None:
     """Featurize each task off the shared MEDS → features.npz + codes.parquet."""
-    from flair_benchmark._clif import read_clif_config
+    from flair_benchmark.cohort.clif import read_clif_config
     site = read_clif_config(clif_config).get("site")
     _do_featurize(clif_config, out, _resolve_tasks(task), site, holdout_only)
 
@@ -334,7 +375,7 @@ def train_cmd(
     hpo_trials: int = typer.Option(30, "--hpo-trials"),
 ) -> None:
     """Fit XGBoost per task on prepared features (fixed vocab); models land in <site>_baseline_models/."""
-    from flair_benchmark._clif import read_clif_config
+    from flair_benchmark.cohort.clif import read_clif_config
     from flair_benchmark.tasks import get_task
 
     site = read_clif_config(clif_config).get("site")
@@ -375,7 +416,7 @@ def infer_cmd(
     viz: bool = typer.Option(True, "--viz/--no-viz"),
 ) -> None:
     """Score shipped models on this site's prepared (holdout) features; report on the 25% test split."""
-    from flair_benchmark._clif import read_clif_config
+    from flair_benchmark.cohort.clif import read_clif_config
     from flair_benchmark.tasks import get_task
 
     site = read_clif_config(clif_config).get("site")
@@ -419,7 +460,7 @@ def build_vocab_cmd(
                                   help="Where to write the committed fixed vocabulary"),
 ) -> None:
     """Regenerate the fixed feature vocabulary from the shared MEDS (maintainer, once)."""
-    from flair_benchmark._clif import read_clif_config
+    from flair_benchmark.cohort.clif import read_clif_config
 
     site = read_clif_config(clif_config).get("site")
     sp = SitePaths.make(out, site)

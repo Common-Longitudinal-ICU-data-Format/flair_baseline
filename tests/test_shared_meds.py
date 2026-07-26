@@ -15,10 +15,10 @@ from __future__ import annotations
 from datetime import datetime
 
 import polars as pl
-
-from flair_benchmark._stitch import members_of_joins
-from flair_benchmark.features.fe_meds import _batches
 from flair_baseline.featurize import count_features
+
+from flair_benchmark.cohort.stitch import members_of_joins
+from flair_benchmark.features.extractors import _batches
 
 
 def _idx() -> pl.DataFrame:

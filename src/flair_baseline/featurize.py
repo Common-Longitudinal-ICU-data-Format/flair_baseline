@@ -46,10 +46,9 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from tqdm.auto import tqdm
-
 import numpy as np
 import polars as pl
+from tqdm.auto import tqdm
 
 JOIN_ID = "hospitalization_join_id"
 

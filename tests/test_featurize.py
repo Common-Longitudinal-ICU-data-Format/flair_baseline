@@ -15,9 +15,15 @@ from datetime import datetime
 
 import numpy as np
 import polars as pl
-
-from flair_baseline.featurize import (ROLE_COUNT, ROLE_ONEHOT, ROLE_STAT, STATS,
-                                      code_role, count_features, feature_names)
+from flair_baseline.featurize import (
+    ROLE_COUNT,
+    ROLE_ONEHOT,
+    ROLE_STAT,
+    STATS,
+    code_role,
+    count_features,
+    feature_names,
+)
 
 # Two encounters, prediction at 2020-01-02. Events strictly before are aggregated.
 # A: 3 lactates + 2 imv + 2 vancomycin before, 1 lactate after (must be dropped).
