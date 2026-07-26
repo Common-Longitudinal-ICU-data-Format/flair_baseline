@@ -12,6 +12,9 @@ out/
 out_external/
 output/
 logs/
+
+# per-task resume stamps written by run_mimic_train.sh
+.mimic_run_stamps/
 *.log
 
 # real site configs — only the .template.json is tracked
