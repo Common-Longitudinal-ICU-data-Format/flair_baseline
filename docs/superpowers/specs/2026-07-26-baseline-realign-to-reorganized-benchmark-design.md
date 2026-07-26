@@ -209,23 +209,23 @@ Success criteria:
   the report dir is empty or the AUROC is `None`.
 - Run the full suite in the baseline venv.
 
-## Known risks
+## Risk outcomes
 
-Resolvable only by running:
-
-1. **Episodic one-row-per-stay guard (most likely blocker).** `build_report`
-   raises when an episodic task has more prediction rows than stays.
-   `extubation_failure_24h` is per-extubation-episode, so a stay with two
-   extubations produces two rows sharing one `hospitalization_join_id`. This
-   guard exists in *both* the old and new wheel, and `run_mimic_train.sh`
-   apparently completed against the old one — so it is probably already handled
-   in `tasks/_finalize.py`. Confirm rather than assume; fall back to
-   `--mode continuous` or a baseline-side dedup.
-2. **Cohort schema drift** could break `compute_counts` or `build_report`'s
-   preds-schema validation (`hospitalization_join_id`, `prediction_id`, `split`,
+1. **Episodic one-row-per-stay guard** — *cleared.* `build_report` raises when an
+   episodic task has more prediction rows than stays, and
+   `extubation_failure_24h` is per-extubation-episode. Measured on the MIMIC test
+   split: `extubation_failure_24h` 5,254 rows / 5,254 stays and
+   `icu_readmission` 13,256 / 13,256 — exactly 1:1. `tasks/_finalize.py` already
+   dedups, so the guard does not trip and no `--mode continuous` fallback is
+   needed.
+2. **`[viz]` extra through a local-path wheel source** — *cleared.* The rebuilt
+   wheel's METADATA carries `Provides-Extra: viz` and
+   `Requires-Dist: matplotlib>=3.7.0; extra == 'viz'`; matplotlib 3.11.0 resolved
+   into the baseline venv.
+3. **Cohort schema drift** — still open until the featurize and report stages
+   complete. Would surface as a `compute_counts` failure or a `build_report`
+   preds-schema rejection (`hospitalization_join_id`, `prediction_id`, `split`,
    label column, `y_prob`).
-3. **`[viz]` extra through a local-path wheel source.** Should work — hatchling
-   emits `Provides-Extra: viz` — but verify at sync time.
 
 ### Resolved during design: the MEDS dtype flip
 
