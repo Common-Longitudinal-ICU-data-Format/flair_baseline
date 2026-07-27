@@ -1,1 +1,1 @@
-"""XGBoost count-feature baseline for FLAIR ICU benchmark tasks."""
+"""XGBoost point-in-time feature baseline for FLAIR ICU benchmark tasks."""

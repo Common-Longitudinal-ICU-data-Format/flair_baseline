@@ -2,30 +2,41 @@
 
 Pipeline is split into stages you run in sequence (no per-task ETL re-runs):
 
-  flair-baseline build-cohorts --clif-config clif.json --out .   # one cohort.parquet + table1 per task
-  flair-baseline build-data    --clif-config clif.json --out .   # ONE shared MEDS (ETL once)
-  flair-baseline featurize     --clif-config clif.json --out .   # per-task features.npz + codes
-  flair-baseline train         --clif-config clif.json --out .   # fit one model per task (fixed vocab)
-  # — at a CLIF site, scope the data pull to the 25% holdout —
-  flair-baseline build-data    … --holdout-only
-  flair-baseline featurize     … --holdout-only
-  flair-baseline infer  --models-dir mimic_baseline_models …
+  flair-baseline build-cohorts   --clif-config clif.json --out .   # one cohort.parquet + table1 per task
+  flair-baseline build-data      --clif-config clif.json --out .   # ONE shared MEDS (ETL once)
+  flair-baseline featurize       --clif-config clif.json --out .   # per-task features.npz + codes
+  flair-baseline local-training  --clif-config clif.json --out .   # fit one model per task (fixed vocab)
   # — maintainer, once — regenerate the committed feature vocabulary —
-  flair-baseline build-vocab   --clif-config clif.json --out .
+  flair-baseline build-vocab     --clif-config clif.json --out .
 
 `prepare` chains build-cohorts → build-data → featurize for a single from-scratch run.
+
+Three ways to get a number, one per model kind (see layout.KINDS). The source site
+(MIMIC) runs `local-training` only and ships its models folder; every other site can
+run all three and compare them on the same local 25% holdout:
+
+  flair-baseline local-training      …                                    → report/local/
+  flair-baseline transfer-learning   --models-dir mimic_baseline_models … → report/transfer/
+  flair-baseline external-validation --models-dir mimic_baseline_models … → report/external_validation/
+
+`local-training` and `transfer-learning` fit on the local train split, so they need
+full-cohort features. A site that only wants `external-validation` can scope the whole
+data pull to the holdout and skip three quarters of the ETL:
+
+  flair-baseline build-data … --holdout-only
+  flair-baseline featurize  … --holdout-only
 
 The CLIF→MEDS ETL runs ONCE over the union of all task cohorts (each join_id expanded
 to its full stitched membership), written to `<site>_baseline_phi/_shared/MEDS/`. Every
 task featurizes off that shared store. The feature vocabulary is a fixed, committed file
-(`vocab.json`) shared by all tasks and all sites — train and infer both load it, so every
-model has the same column space and bundles are interchangeable.
+(`vocab.json`) shared by all tasks and all sites, so every model has the same column
+space and bundles are interchangeable.
 
 Artifacts partition by sensitivity (see layout.py):
   <site>_baseline_phi/_shared/MEDS/      shared events (PHI, stays local)
-  <site>_baseline_phi/<task>/            cohort.parquet, features.npz, preds.parquet
-  <site>_baseline_non_phi_for_upload/…   codes.parquet, table1.json, report/*.json (+ viz)
-  <site>_baseline_models/<task>/         model.json, vocab.json
+  <site>_baseline_phi/<task>/            cohort.parquet, features.npz, preds_<kind>.parquet
+  <site>_baseline_non_phi_for_upload/…   codes.parquet, table1.json, report/<kind>/*.json (+ viz)
+  <site>_baseline_models/<task>/<kind>/  model.json, vocab.json, params.json
 """
 from __future__ import annotations
 
@@ -50,7 +61,15 @@ from flair_baseline.featurize import (
     save_counts,
     truncated_code_map,
 )
-from flair_baseline.layout import SitePaths, TaskPaths, report_mode
+from flair_baseline.layout import (
+    KIND_EXTERNAL,
+    KIND_LOCAL,
+    KIND_TRANSFER,
+    SitePaths,
+    TaskPaths,
+    report_mode,
+    resolve_shipped_model,
+)
 from flair_baseline.train import train_and_score
 
 DEFAULT_CLIF_CONFIG = "config/clif_config.template.json"
@@ -157,6 +176,40 @@ def _load_vocab(vocab_path: str) -> tuple[list[str], list[int]]:
     vocab = data["vocab"] if isinstance(data, dict) else list(data)
     roles = data.get("roles") if isinstance(data, dict) else None
     return vocab, (list(roles) if roles else [code_role(c) for c in vocab])
+
+
+def _load_shipped_vocab(vocab_path: Path) -> tuple[list[str], list[int]]:
+    """Vocabulary out of a shipped model bundle → (truncated codes, roles).
+
+    Inference and transfer resolve against the SHIPPED vocabulary, not the local
+    committed one: the shipped model's trees index into the source site's column
+    layout, and reading that layout back from the bundle is what makes the match
+    an invariant rather than a coincidence.
+    """
+    saved = json.loads(vocab_path.read_text())
+    vocab = saved["vocab"]
+    roles = (list(saved["roles"]) if saved.get("roles")
+             else [code_role(c) for c in vocab])
+    return vocab, roles
+
+
+def _features_for_fit(paths: TaskPaths, task_name: str, cohort: pl.DataFrame):
+    """Load features for a command that FITS on the train split, or exit.
+
+    ``load_counts`` validates the cache against the cohort's prediction-id hash,
+    so a holdout-only features.npz (test rows only) simply does not match a
+    full cohort — which is exactly the mistake worth naming in the message.
+    """
+    counts = load_counts(paths.features, cohort)
+    if counts is None:
+        typer.echo(
+            f"[{task_name}] no features.npz matching the full cohort at "
+            f"{paths.features} — fitting needs the train split too. Re-run "
+            f"`flair-baseline build-data` and `flair-baseline featurize` WITHOUT "
+            f"--holdout-only (that flag only supports `external-validation`).",
+            err=True)
+        raise typer.Exit(1)
+    return counts
 
 
 # --------------------------------------------------------------------------- #
@@ -300,19 +353,20 @@ def _do_featurize(clif_config: str, out: str, tasks: list[str], site: str,
 # stage: report (shared by train + infer)
 # --------------------------------------------------------------------------- #
 def _report(paths: TaskPaths, task_name: str, clif_config: str, preds: pl.DataFrame,
-            label_col: str, report: bool, viz: bool) -> None:
+            label_col: str, report: bool, viz: bool, kind: str) -> None:
     from flair_benchmark.cohort.clif import read_clif_config
 
+    report_dir = paths.report_dir(kind)
     auc_tr, auc_te = _auroc(preds, label_col, "train"), _auroc(preds, label_col, "test")
     if not report:
-        typer.echo(f"[{task_name}] row-level AUROC  train={auc_tr}  test={auc_te}")
+        typer.echo(f"[{task_name}] ({kind}) row-level AUROC  train={auc_tr}  test={auc_te}")
         return
     from flair_benchmark.report import build_report
     from flair_benchmark.tasks import get_task
     site = read_clif_config(clif_config).get("site")
     mode = report_mode(task_name)
     try:
-        build_report(str(paths.preds), get_task(task_name), str(paths.report_dir),
+        build_report(str(paths.preds(kind)), get_task(task_name), str(report_dir),
                      cohort_path=str(paths.cohort), viz=viz, site=site, mode=mode)
     except Exception as exc:
         # build_report writes the report JSONs first, THEN renders PNGs. It guards
@@ -322,15 +376,15 @@ def _report(paths: TaskPaths, task_name: str, clif_config: str, preds: pl.DataFr
         # not. So: if the headline JSON landed, the failure was in the viz stage —
         # warn and carry on. If it didn't, report generation itself failed and the
         # error is real, so re-raise.
-        if not _headline_json(paths.report_dir, mode).exists():
+        if not _headline_json(report_dir, mode).exists():
             raise
         typer.echo(f"[{task_name}] report JSONs written, but visualization failed "
                    f"— continuing with an incomplete PNG set. "
                    f"{type(exc).__name__}: {exc}", err=True)
-    rep_auc, lbl = _report_auroc(paths.report_dir, mode)
-    typer.echo(f"[{task_name}] report AUROC ({mode}{lbl}, test)={rep_auc}  "
+    rep_auc, lbl = _report_auroc(report_dir, mode)
+    typer.echo(f"[{task_name}] {kind} report AUROC ({mode}{lbl}, test)={rep_auc}  "
                f"[row-level train={auc_tr} test={auc_te}]")
-    typer.echo(f"[{task_name}] report ({mode}){' + viz' if viz else ''} → {paths.report_dir}")
+    typer.echo(f"[{task_name}] report ({mode}){' + viz' if viz else ''} → {report_dir}")
 
 
 # --------------------------------------------------------------------------- #
@@ -385,8 +439,9 @@ def featurize_cmd(
     _do_featurize(clif_config, out, _resolve_tasks(task), site, holdout_only)
 
 
-@app.command("train")
-def train_cmd(
+@app.command("local-training")
+@app.command("train", hidden=True)          # pre-kind name, kept so old scripts run
+def local_training_cmd(
     clif_config: str = typer.Option(DEFAULT_CLIF_CONFIG, "--clif-config"),
     out: str = typer.Option(".", "--out"),
     task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = every task"),
@@ -397,7 +452,7 @@ def train_cmd(
     hpo: bool = typer.Option(True, "--hpo/--no-hpo"),
     hpo_trials: int = typer.Option(30, "--hpo-trials"),
 ) -> None:
-    """Fit XGBoost per task on prepared features (fixed vocab); models land in <site>_baseline_models/."""
+    """Fit XGBoost on THIS site's train split (fixed vocab) → models/<task>/local/."""
     from flair_benchmark.cohort.clif import read_clif_config
     from flair_benchmark.tasks import get_task
 
@@ -406,31 +461,83 @@ def train_cmd(
     n_trials = hpo_trials if hpo else 0
     tasks = _resolve_tasks(task)
     for i, t in enumerate(tasks, 1):
-        typer.echo(f"━━ train {t} ({i}/{len(tasks)}) ━━")
+        typer.echo(f"━━ local-training {t} ({i}/{len(tasks)}) ━━")
         label_col = get_task(t).META["label_column"]
         paths = TaskPaths.make(out, site, t)
-        paths.mkdirs()
+        paths.mkdirs(KIND_LOCAL)
         cohort = _read_cohort(paths, t, "build-cohorts")
-        counts = load_counts(paths.features, cohort)
-        if counts is None:
-            typer.echo(f"[{t}] no matching features.npz — run `flair-baseline featurize` "
-                       f"first", err=True)
-            raise typer.Exit(1)
+        counts = _features_for_fit(paths, t, cohort)
         X, ids, names = counts_to_X(counts, vocab=fixed_vocab, roles=fixed_roles)
         typer.echo(f"[{t}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} "
                    f"(+extras) from {len(fixed_vocab):,} codes "
                    f"— training XGBoost ({f'HPO {n_trials} trials' if n_trials else 'fixed params'})")
         preds = train_and_score(X, ids, names, cohort, label_col,
-                                model_out=str(paths.model), vocab_out=str(paths.vocab),
+                                model_out=str(paths.model(KIND_LOCAL)),
+                                vocab_out=str(paths.vocab(KIND_LOCAL)),
                                 vocab_meta={"vocab": fixed_vocab, "roles": fixed_roles},
-                                params_out=str(paths.params), n_trials=n_trials,
+                                params_out=str(paths.params(KIND_LOCAL)), n_trials=n_trials,
                                 time_since_first=counts.time_since_first)
-        preds.write_parquet(paths.preds)
-        _report(paths, t, clif_config, preds, label_col, report, viz)
+        preds.write_parquet(paths.preds(KIND_LOCAL))
+        _report(paths, t, clif_config, preds, label_col, report, viz, KIND_LOCAL)
 
 
-@app.command("infer")
-def infer_cmd(
+@app.command("transfer-learning")
+def transfer_learning_cmd(
+    models_dir: str = typer.Option(..., "--models-dir",
+                                   help="A source site's models folder (e.g. mimic_baseline_models)"),
+    clif_config: str = typer.Option(DEFAULT_CLIF_CONFIG, "--clif-config"),
+    out: str = typer.Option(".", "--out"),
+    task: Optional[str] = typer.Option(None, "--task", help="Task name/prefix; default = every task"),
+    report: bool = typer.Option(True, "--report/--no-report"),
+    viz: bool = typer.Option(True, "--viz/--no-viz"),
+    hpo: bool = typer.Option(True, "--hpo/--no-hpo"),
+    hpo_trials: int = typer.Option(30, "--hpo-trials"),
+) -> None:
+    """Continue training a shipped model on THIS site's train split → models/<task>/transfer/."""
+    from flair_benchmark.cohort.clif import read_clif_config
+    from flair_benchmark.tasks import get_task
+
+    site = read_clif_config(clif_config).get("site")
+    models_root = Path(models_dir)
+    n_trials = hpo_trials if hpo else 0
+    tasks = _resolve_tasks(task)
+    for i, t in enumerate(tasks, 1):
+        typer.echo(f"━━ transfer-learning {t} ({i}/{len(tasks)}) ━━")
+        shipped = resolve_shipped_model(models_root, t)
+        if shipped is None:
+            # Never silently degrade into a from-scratch fit: the report would
+            # land in report/transfer/ carrying a local-only model's numbers.
+            typer.echo(f"[{t}] no shipped model under {models_root / t} — skipping "
+                       f"(looked in <task>/local/ and <task>/)", err=True)
+            continue
+        model_path, vocab_path = shipped
+        vocab_list, roles_list = _load_shipped_vocab(vocab_path)
+        label_col = get_task(t).META["label_column"]
+        paths = TaskPaths.make(out, site, t)
+        paths.mkdirs(KIND_TRANSFER)
+        cohort = _read_cohort(paths, t, "build-cohorts")
+        counts = _features_for_fit(paths, t, cohort)
+        # Shipped vocabulary, not the local one — the base trees index into the
+        # source site's column layout.
+        X, ids, names = counts_to_X(counts, vocab=vocab_list, roles=roles_list)
+        typer.echo(f"[{t}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} (+extras) "
+                   f"— boosting {model_path} further "
+                   f"({f'HPO {n_trials} trials' if n_trials else 'fixed params'})")
+        preds = train_and_score(X, ids, names, cohort, label_col,
+                                base_model=str(model_path),
+                                model_out=str(paths.model(KIND_TRANSFER)),
+                                vocab_out=str(paths.vocab(KIND_TRANSFER)),
+                                vocab_meta={"vocab": vocab_list, "roles": roles_list,
+                                            "base_model": str(model_path)},
+                                params_out=str(paths.params(KIND_TRANSFER)), n_trials=n_trials,
+                                time_since_first=counts.time_since_first)
+        preds.write_parquet(paths.preds(KIND_TRANSFER))
+        _report(paths, t, clif_config, preds, label_col, report, viz, KIND_TRANSFER)
+
+
+@app.command("external-validation")
+@app.command("infer", hidden=True)          # pre-kind name, kept so old scripts run
+def external_validation_cmd(
     models_dir: str = typer.Option(..., "--models-dir"),
     clif_config: str = typer.Option(DEFAULT_CLIF_CONFIG, "--clif-config"),
     out: str = typer.Option(".", "--out"),
@@ -438,7 +545,7 @@ def infer_cmd(
     report: bool = typer.Option(True, "--report/--no-report"),
     viz: bool = typer.Option(True, "--viz/--no-viz"),
 ) -> None:
-    """Score shipped models on this site's prepared (holdout) features; report on the 25% test split."""
+    """Score shipped models, frozen, on this site's 25% holdout → report/external_validation/."""
     from flair_benchmark.cohort.clif import read_clif_config
     from flair_benchmark.tasks import get_task
 
@@ -446,33 +553,40 @@ def infer_cmd(
     models_root = Path(models_dir)
     tasks = _resolve_tasks(task)
     for i, t in enumerate(tasks, 1):
-        typer.echo(f"━━ infer {t} ({i}/{len(tasks)}) ━━")
-        model_path = models_root / t / "model.json"
-        vocab_path = models_root / t / "vocab.json"
-        if not (model_path.exists() and vocab_path.exists()):
+        typer.echo(f"━━ external-validation {t} ({i}/{len(tasks)}) ━━")
+        shipped = resolve_shipped_model(models_root, t)
+        if shipped is None:
             typer.echo(f"[{t}] no model under {models_root / t} — skipping")
             continue
-        saved = json.loads(vocab_path.read_text())
-        vocab_list = saved["vocab"]
-        roles_list = (list(saved["roles"]) if saved.get("roles")
-                      else [code_role(c) for c in vocab_list])
+        model_path, vocab_path = shipped
+        vocab_list, roles_list = _load_shipped_vocab(vocab_path)
         label_col = get_task(t).META["label_column"]
         paths = TaskPaths.make(out, site, t)
-        paths.mkdirs()
-        score_cohort = _read_cohort(paths, t, "build-cohorts").filter(pl.col("split") == "test")
+        paths.mkdirs(KIND_EXTERNAL)
+        # Accept either featurization scope. A site running all three kinds
+        # featurized the FULL cohort (local/transfer fit on the train split); a
+        # site that only wants this command may have featurized holdout-only.
+        # Whichever npz is on disk, the report's headline is the test split.
+        full_cohort = _read_cohort(paths, t, "build-cohorts")
+        score_cohort = full_cohort
         counts = load_counts(paths.features, score_cohort)
         if counts is None:
-            typer.echo(f"[{t}] no matching features.npz — run `flair-baseline featurize "
-                       f"--holdout-only` first", err=True)
+            score_cohort = full_cohort.filter(pl.col("split") == "test")
+            counts = load_counts(paths.features, score_cohort)
+        if counts is None:
+            typer.echo(f"[{t}] no features.npz matching either the full cohort or its "
+                       f"test split at {paths.features} — run `flair-baseline featurize` "
+                       f"(add --holdout-only to score the 25% holdout alone)", err=True)
             raise typer.Exit(1)
+        scope = "full cohort" if score_cohort.height == full_cohort.height else "holdout"
         X, ids, names = counts_to_X(counts, vocab=vocab_list, roles=roles_list)
-        typer.echo(f"[{t}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} (+extras) "
-                   f"— scoring with shipped model")
+        typer.echo(f"[{t}] feature matrix: {X.shape[0]:,} × {X.shape[1]:,} (+extras, "
+                   f"{scope}) — scoring with shipped model, frozen")
         preds = train_and_score(X, ids, names, score_cohort, label_col,
                                 model_in=str(model_path),
                                 time_since_first=counts.time_since_first)
-        preds.write_parquet(paths.preds)
-        _report(paths, t, clif_config, preds, label_col, report, viz)
+        preds.write_parquet(paths.preds(KIND_EXTERNAL))
+        _report(paths, t, clif_config, preds, label_col, report, viz, KIND_EXTERNAL)
 
 
 @app.command("build-vocab")
@@ -525,7 +639,10 @@ def prepare_cmd(
     _do_build_data(clif_config, elf_config, out, tasks, site, idx, holdout_only, reuse,
                    batch_size if pmc else None)
     _do_featurize(clif_config, out, tasks, site, holdout_only)
-    typer.echo("[prepare] done — run `flair-baseline train` or `infer` next")
+    nxt = ("`flair-baseline external-validation --models-dir …` next" if holdout_only else
+           "`flair-baseline local-training`, `transfer-learning` or "
+           "`external-validation` next")
+    typer.echo(f"[prepare] done — run {nxt}")
 
 
 def main() -> None:

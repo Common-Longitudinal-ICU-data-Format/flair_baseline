@@ -71,7 +71,8 @@ _DEFAULT_PARAMS = dict(
 
 
 def tune_xgb(X_train: np.ndarray, y_train: np.ndarray, scale_pos_weight: float,
-             n_trials: int = 30, max_tune_rows: int = 2_000_000) -> dict:
+             n_trials: int = 30, max_tune_rows: int = 2_000_000,
+             base_margin: np.ndarray | None = None) -> dict:
     """Optuna search → best XGBoost params (maximizing 5-fold CV AUROC).
 
     Runs ``n_trials`` TPE-sampled trials; each scores via ``xgb.cv`` on the train
@@ -82,6 +83,13 @@ def tune_xgb(X_train: np.ndarray, y_train: np.ndarray, scale_pos_weight: float,
     For very large tasks (a multi-million-row hourly grid) the CV would exhaust
     RAM, so the *search* runs on a deterministic ``max_tune_rows`` subsample; the
     final model is still fit on the full train split by the caller.
+
+    ``base_margin`` is how transfer learning gets tuned. ``xgb.cv`` takes no
+    ``xgb_model=`` argument, so continued boosting cannot be cross-validated
+    directly — but boosting on top of an existing ensemble is exactly boosting
+    with that ensemble's raw output as a per-row offset, which ``xgb.cv`` does
+    support. ``DMatrix.slice`` carries the margin into each fold, so the search
+    space and trial count stay identical to a from-scratch fit.
     """
     import optuna
 
@@ -90,9 +98,13 @@ def tune_xgb(X_train: np.ndarray, y_train: np.ndarray, scale_pos_weight: float,
         rng = np.random.default_rng(0)
         idx = np.sort(rng.choice(X_train.shape[0], size=max_tune_rows, replace=False))
         X_tune, y_tune = X_train[idx], y_train[idx]
+        margin_tune = None if base_margin is None else base_margin[idx]
     else:
         X_tune, y_tune = X_train, y_train
+        margin_tune = base_margin
     dtrain = xgb.DMatrix(X_tune, label=y_tune)
+    if margin_tune is not None:
+        dtrain.set_base_margin(np.asarray(margin_tune, dtype="float32"))
     # Stratified CV needs ≥ nfold samples per class; cap folds for tiny/imbalanced tasks.
     n_pos = int((y_tune == 1).sum())
     n_neg = int((y_tune == 0).sum())
@@ -128,9 +140,15 @@ def train_and_score(X: np.ndarray, prediction_ids: list[str],
                     model_out: str | None = None, vocab_out: str | None = None,
                     vocab_meta: dict | None = None,
                     params_out: str | None = None, n_trials: int = 30,
-                    model_in: str | None = None,
+                    model_in: str | None = None, base_model: str | None = None,
                     time_since_first: np.ndarray | None = None) -> pl.DataFrame:
-    """Train (unless model_in given) and score every prediction. Returns the preds frame."""
+    """Train (unless model_in given) and score every prediction. Returns the preds frame.
+
+    ``model_in`` scores a frozen model and fits nothing. ``base_model`` does the
+    opposite: it seeds a fit, appending locally-trained trees to a shipped
+    ensemble. The saved model is self-contained (base trees + local trees), so
+    scoring it later needs no companion file.
+    """
     have = [c for c in (*_EXTRA_NUMERIC, "sex_category") if c in task_df.columns]
     meta = task_df.select("prediction_id", "hospitalization_id", JOIN_ID,
                           "split", label_col, *have)
@@ -150,29 +168,52 @@ def train_and_score(X: np.ndarray, prediction_ids: list[str],
     split = d["split"].to_numpy()
     train_mask = split == "train"
 
+    base_booster = None
+    if base_model:
+        base_booster = xgb.Booster()
+        base_booster.load_model(base_model)
+        # The base trees index into the SOURCE site's column layout. A width
+        # mismatch means the shipped vocab and the local features disagree, and
+        # every appended tree would be split on the wrong feature.
+        n_base = base_booster.num_features()
+        if n_base != X_full.shape[1]:
+            raise ValueError(
+                f"base model expects {n_base:,} features but the local matrix has "
+                f"{X_full.shape[1]:,}. The shipped vocab.json and this site's "
+                f"features.npz disagree — re-featurize against the shipped vocabulary.")
+
     if model_in:
         booster = xgb.Booster()
         booster.load_model(model_in)
         prob = booster.inplace_predict(X_full)
     elif train_mask.sum() == 0 or len(np.unique(y[train_mask])) < 2 or X_full.shape[1] == 0:
-        base = float(y[train_mask].mean()) if train_mask.sum() else 0.0
-        prob = np.full(X_full.shape[0], base, dtype="float32")
+        # Nothing fittable. With a base model in hand, scoring it beats emitting a
+        # constant — falling back to the prevalence would throw away the transfer.
+        if base_booster is not None:
+            prob = base_booster.inplace_predict(X_full)
+        else:
+            base = float(y[train_mask].mean()) if train_mask.sum() else 0.0
+            prob = np.full(X_full.shape[0], base, dtype="float32")
     else:
         # scale_pos_weight removed (was neg/pos). Upweighting the rare positive class
         # improves ranking/recall but inflates predicted risk (O:E > 1) and wrecks
         # probability calibration. Neutral weight keeps predictions on the prevalence
         # scale; class imbalance is instead reflected honestly in the probabilities.
         spw = 1.0
+        margin = (None if base_booster is None else
+                  base_booster.inplace_predict(X_full[train_mask], predict_type="margin"))
         if n_trials and n_trials > 0:
-            best = tune_xgb(X_full[train_mask], y[train_mask], spw, n_trials=n_trials)
+            best = tune_xgb(X_full[train_mask], y[train_mask], spw, n_trials=n_trials,
+                            base_margin=margin)
         else:
             best = dict(_DEFAULT_PARAMS)
         clf = xgb.XGBClassifier(
             **best, **_FIXED_PARAMS, eval_metric="logloss",
             scale_pos_weight=spw, n_jobs=-1, missing=np.nan,
         )
-        print(f"  fitting final model on {int(train_mask.sum()):,} rows …", flush=True)
-        clf.fit(X_full[train_mask], y[train_mask])
+        seeded = "" if base_booster is None else f" on top of {base_booster.num_boosted_rounds():,} base trees"
+        print(f"  fitting final model on {int(train_mask.sum()):,} rows{seeded} …", flush=True)
+        clf.fit(X_full[train_mask], y[train_mask], xgb_model=base_booster)
         prob = clf.predict_proba(X_full)[:, 1]
         if model_out:
             clf.get_booster().save_model(model_out)

@@ -1,7 +1,7 @@
 [project]
 name = "flair-baseline"
 version = "0.1.0"
-description = "XGBoost count-feature baseline for FLAIR ICU benchmark tasks"
+description = "XGBoost point-in-time feature baseline for FLAIR ICU benchmark tasks"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

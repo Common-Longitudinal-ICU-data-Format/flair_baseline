@@ -1,14 +1,14 @@
 # flair-baseline — end-to-end flow
 
-XGBoost **count-feature** baseline for the FLAIR ICU tasks, trained on MIMIC-IV with a leak-free **75/25 split on `hospitalization_join_id`**. Features are counts of every ELF event code that occurs **strictly before** each prediction's `prediction_dttm` (point-in-time, no leakage). This is a **self-contained sub-project**: the FLAIR library is cloned in beside it (`./flair`) and pinned as an editable path dep; the baseline carries its own config (`config/`). Train once at a source site, ship the **models folder** to other sites, re-run there — the code travels to the data.
+XGBoost **point-in-time feature** baseline for the FLAIR ICU tasks, trained on MIMIC-IV with a leak-free **75/25 split on `hospitalization_join_id`**. Every feature summarizes the ELF events of one code that occur **strictly before** each prediction's `prediction_dttm` — numeric codes as min/max/mean/median, medications as exposure counts, categorical respiratory settings as presence indicators (§2③). This is a **self-contained sub-project**: the FLAIR library ships as a prebuilt wheel under `wheels/`; the baseline carries its own config (`config/`). Train once at a source site, ship the **models folder** to other sites, re-run there — the code travels to the data.
 
 Every run partitions its artifacts into three **site-prefixed** folders (see §3); only the non-PHI folder leaves the site.
 
 ```         
-                         ┌──────────────────── flair-baseline train | infer ────────────────────┐
- task.build()            │                                                                        │
- (flair_benchmark) ──► cohort ──► FE-meds ──► MEDS.parquet ──► count featurizer ──► XGBoost ──► preds ──► report (+viz)
-                       (split)   (CLIF→MEDS)  + codes.parquet   (sparse, leak-free)  (model)   .parquet   JSON / PNG
+                         ┌─────────── prepare ───────────┐┌──── local-training │ transfer-learning │ external-validation ────┐
+ task.build()            │                               ││                                                                  │
+ (flair_benchmark) ──► cohort ──► FE-meds ──► MEDS.parquet ──► role featurizer ──► XGBoost ──► preds ──► report (+viz)
+                       (split)   (CLIF→MEDS)  + codes.parquet   (dense, leak-free)  (model)   _<kind>   <kind>/ JSON / PNG
 ```
 
 | stage | code | output (folder) |
@@ -16,8 +16,8 @@ Every run partitions its artifacts into three **site-prefixed** folders (see §3
 | ① cohort | `flair_benchmark/tasks/taskN_*.py` + `_split.py` | `cohort.parquet` (PHI) |
 | ② FE-meds | `flair_benchmark/features/fe_meds.py` + `flair_benchmark/meds_etl/` | `MEDS.parquet` (PHI), `codes.parquet` (non-PHI) |
 | ③ featurize | `flair_baseline/featurize.py` | in-memory sparse CSR |
-| ④ train/score | `flair_baseline/train.py` | `model.json`, `vocab.json` (models), `preds.parquet` (PHI) |
-| ⑤ report | `flair_benchmark.report.build_report` | `report/*.json` (+ `viz/*.png`) (non-PHI) |
+| ④ train/score | `flair_baseline/train.py` | `<kind>/model.json`, `<kind>/vocab.json` (models), `preds_<kind>.parquet` (PHI) |
+| ⑤ report | `flair_benchmark.report.build_report` | `report/<kind>/*.json` (+ `viz/*.png`) (non-PHI) |
 
 Folder routing is owned by `flair_baseline/layout.py` (`TaskPaths`, `report_mode`).
 
@@ -39,14 +39,19 @@ cp config/clif_config.template.json config/clif_config.json   # set "site" + "da
 
 ## 1. Commands
 
-Two subcommands. `train` fits models at a source site; `infer` scores a shipped model at a new site. Both emit the three site-prefixed folders (§3); the `site` comes from the clif config and prefixes every folder.
+The pipeline is **staged**: data preparation runs once, then any number of model
+commands run off the prepared artifacts. Every command emits the three
+site-prefixed folders (§3); the `site` comes from the clif config and prefixes
+every folder.
 
-### `flair-baseline train`
+### Preparation (run once per site)
 
 ```         
-flair-baseline train [--clif-config config/clif_config.json] [--elf-config flair_elf_config.yaml]
-                     [--out .] [--task NAME] [--train-end YYYY-MM-DD] [--test-start YYYY-MM-DD]
-                     [--report/--no-report] [--viz/--no-viz] [--reuse/--no-reuse]
+flair-baseline build-cohorts --clif-config config/clif_config.json --out .
+flair-baseline build-data    --clif-config config/clif_config.json --out . [--holdout-only] [--reuse] [--pmc]
+flair-baseline featurize     --clif-config config/clif_config.json --out . [--holdout-only]
+
+flair-baseline prepare       --clif-config config/clif_config.json --out .   # all three in one go
 ```
 
 | flag | default | meaning |
@@ -56,26 +61,56 @@ flair-baseline train [--clif-config config/clif_config.json] [--elf-config flair
 | `--out` | `.` | root for the three `<site>_baseline_*` folders |
 | `--task` | all tasks | task name or prefix (`extubation` → `extubation_failure_24h`) |
 | `--train-end` / `--test-start` | none | date cutoff for non-mimic sites (omit on mimic) |
-| `--report` / `--no-report` | report | build the FLAIR report bundle (mode per task; see §2⑤) |
-| `--viz` / `--no-viz` | no-viz | also render sanity-check PNGs into `report/viz/` |
-| `--reuse` / `--no-reuse` | no-reuse | reuse existing `cohort.parquet` + `MEDS.parquet` (skip ETL) |
+| `--holdout-only` / `--full-cohort` | full-cohort | scope the ETL + featurization to the 25% test split |
+| `--reuse` / `--no-reuse` | no-reuse | reuse the shared MEDS when its manifest key matches |
+| `--pmc` / `--batch-size` | off / 4000 | batch the ETL for bounded RAM |
+
+`--holdout-only` is the cheap path for a site that **only** wants
+`external-validation`. The two fitting commands below need the train split, so a
+site running all three must prepare the full cohort.
+
+### Model commands — one per kind
+
+The `kind` (`local`, `transfer`, `external_validation`) is the one axis that
+separates a site's answers. It routes the preds file, the report directory and
+the model bundle, and nothing else.
+
+| command | fits? | base model | rows scored | writes |
+|---|---|---|---|---|
+| `local-training` | yes, on the local train split | — | all | `report/local/`, `models/<task>/local/` |
+| `transfer-learning` | yes, continues the shipped ensemble | `--models-dir` | all | `report/transfer/`, `models/<task>/transfer/` |
+| `external-validation` | no — frozen | `--models-dir` | test (or all, if prepared) | `report/external_validation/` |
+
+All three take `--report/--no-report` and `--viz/--no-viz`; the two fitting
+commands also take `--hpo/--no-hpo` and `--hpo-trials` (default 30).
+`train` and `infer` remain as hidden aliases for `local-training` and
+`external-validation`, so pre-existing scripts keep working.
 
 ``` bash
-# all tasks on MIMIC, with report + PNGs
-uv run flair-baseline train --clif-config config/clif_config.json --out . --viz
+# source site (MIMIC): fit and ship
+uv run flair-baseline local-training --clif-config config/clif_config_mimic.json --out . --viz
 
-# one task
-uv run flair-baseline train --task extubation_failure_24h --clif-config config/clif_config.json --out .
+# external site: all three answers on the SAME local 25% holdout
+uv run flair-baseline external-validation --models-dir mimic_baseline_models --clif-config config/clif_config.json --out . --viz
+uv run flair-baseline transfer-learning   --models-dir mimic_baseline_models --clif-config config/clif_config.json --out . --viz
+uv run flair-baseline local-training      --clif-config config/clif_config.json --out . --viz
 ```
 
-### `flair-baseline infer` (new site — only the models folder travels)
+Copy a source site's `*_baseline_models/` to the new site. Each command rebuilds
+nothing — it reads the prepared cohort + features, re-applies the deterministic
+**75/25 block split**, and reports on the resulting **25% test** set. Send back
+only `<site>_baseline_non_phi_for_upload/`. Because ELF standardizes the code
+vocabulary across CLIF sites, a shipped model applies without code remapping.
 
-```         
-flair-baseline infer --models-dir <SITE>_baseline_models [--clif-config config/clif_config.json]
-                     [--elf-config …] [--out .] [--task NAME] [--report/--no-report] [--viz/--no-viz]
-```
-
-Copy a training site's `*_baseline_models/` to the new site. `infer` rebuilds the cohort + features from the **local** data, re-applies the deterministic **75/25 block split**, and scores the shipped model on the resulting **25% test** set — then writes this site's three folders. Send back only `<site>_baseline_non_phi_for_upload/`. Because ELF standardizes the code vocabulary across CLIF sites, the model applies without code remapping.
+**How transfer learning works.** XGBoost has no fine-tuning, so
+`transfer-learning` keeps the shipped ensemble and appends trees fit on local
+train rows (`xgb_model=`). Hyperparameters are tuned the same way as a
+from-scratch fit — `xgb.cv` accepts no `xgb_model=`, so the search expresses
+continued boosting as the base ensemble's raw output used as a per-row
+`base_margin`, which is mathematically the same thing. The saved model is
+self-contained (base trees + local trees); scoring it needs no companion file.
+It resolves the shipped **vocab.json** rather than the local one, because the
+base trees index into the source site's column layout.
 
 ------------------------------------------------------------------------
 
@@ -121,28 +156,47 @@ HOSP_DX//ICD10CM//A41.9
 
 Notes: - **Timestamps**: clifpy loads each table converting UTC → site-local **once**, then `strip_tz` drops the tz (`replace_time_zone(None)`) — wall-clock preserved, no second conversion. - The ETL emit is **vectorized polars** (one frame per concept), not row-by-row. - The data table is **not** stamped with `prediction_id`/`prediction_dttm` — the prediction join and the leak filter live in the featurizer, keeping this table compact and reusable.
 
-### ③ Count featurizer — `flair_baseline/featurize.py`
+### ③ Role featurizer — `flair_baseline/featurize.py`
 
-`count_features(events, task_df, label_col, vocab=None, n_chunks=8, exclude_prefixes=…)` → `(X_csr, prediction_ids, vocab)`.
+`compute_counts(events, task_df, …)` → `Counts`; `counts_to_X(counts, vocab, roles)` → `(X, prediction_ids, feature_names)`.
 
 ```         
-count[prediction_id, code] = #events of code in the same hospitalization_join_id
-                             with  time < prediction_dttm        ← strict point-in-time
+feature[prediction_id, code] = aggregate of that code's events in the same
+                               hospitalization_join_id with time < prediction_dttm
+                                                              ↑ strict point-in-time
 ```
 
+**Truncation first — the unit is never a feature.** ELF codes are `//`-hierarchies of varying depth, truncated by value type before aggregation:
+
+| code type | depth | example |
+|---|---|---|
+| numeric (carries `numeric_value`) | 2, `DOMAIN//concept` | `LAB//lactate//mmol/l//bmp` → `LAB//lactate` |
+| categorical (text only) | 3, `DOMAIN//category//value` | `RESP//device_category//imv` |
+
+**Then aggregation by role** (`code_role()` — a pure function of the truncated string, so a committed `vocab.json` alone determines the column layout):
+
+| role | applies to | columns | never observed |
+|---|---|---|---|
+| `ROLE_STAT` | labs, vitals, GCS/RASS, numeric resp params | 4 — `::min`, `::max`, `::mean`, `::median` | **NaN** (missing branch) |
+| `ROLE_COUNT` | `MED_CON//`, `MED_INT//` | 1 — #administration events | genuine `0` |
+| `ROLE_ONEHOT` | `RESP//device_category//*`, `RESP//mode_category//*`, other categoricals | 1 — ever-occurred 0/1 | `0` |
+
 - **No leak**: events join predictions on `hospitalization_join_id`, then `time < prediction_dttm` (strict `<`). One feature row per `prediction_id`.
-- **Sparse only**: result is a scipy CSR (`n_predictions × |vocab|`). A dense matrix would be hundreds of GB on the big tasks.
-- **Scale**: codes + encounter blocks are factorized to int32 *before* the join (no strings in the \~100 M-row heavy path), and the join runs in `n_chunks` block-hash partitions so peak memory is \~1/`n_chunks` of the aggregation.
-- **Vocabulary**: fit on the **train split only**; test predictions align to it (unseen codes dropped). `score` passes a saved vocab instead.
+- **NaN ≠ 0**: a lab never drawn is not a lab that measured zero. Ordering is selective, so "never measured" is itself signal. Medication counts are the opposite — never given genuinely is 0.
+- **Dense float32**: 442 columns from 211 codes on MIMIC. Even a 262k-row cohort stays under 500 MB, and `tree_method="hist"` suits dense better than a CSR that would store every NaN explicitly.
+- **Scale**: truncated codes + encounter blocks are factorized to uint32 *before* the join (no strings in the \~100 M-row heavy path), and the join runs in `n_chunks` block-hash partitions so the exploded event×prediction frame peaks at \~1/`n_chunks`.
+- **Vocabulary**: a fixed, committed `vocab.json` shared by every task and every site — not fit per run. `build-vocab` regenerates it (maintainer only).
 - **HOSP_DX excluded**: `feature_exclude_prefixes: [HOSP_DX]` — discharge diagnoses are post-hoc (assigned for the whole stay at coding time) and leak. They stay in `MEDS.parquet` for audit but never become features.
 
 ### ④ XGBoost — `flair_baseline/train.py`
 
-`train_and_score(X, prediction_ids, vocab, task_df, label_col, …)`:
+`train_and_score(X, prediction_ids, feature_names, task_df, label_col, …)`:
 
-- Appends `age_at_admission` as a dense column after the count columns.
-- `xgboost.XGBClassifier(n_estimators=300, max_depth=6, learning_rate=0.1, subsample=0.8, colsample_bytree=0.8, tree_method="hist", eval_metric="logloss", scale_pos_weight=neg/pos)`.
+- Appends dense extras after the code columns, in a fixed code-side order so every site matches: `age_at_admission`, `sex__Female`, `sex__Male` (both NaN when sex is unknown/other), `time_since_first_hrs`.
+- Hyperparameters come from an Optuna TPE search by default (30 trials, 5-fold `xgb.cv` AUROC on **train rows only**); `--no-hpo` falls back to a hand-tuned set. Fixed across both: `tree_method="hist"`, `random_state=0`.
+- **`scale_pos_weight` is 1.0, deliberately.** Upweighting the rare positive class improves ranking but inflates predicted risk (O:E > 1) and wrecks calibration. Neutral weight keeps predictions on the prevalence scale; imbalance is reflected honestly in the probabilities instead.
 - Fits on `split=="train"`, scores **every** row (so the report can bin by split).
+- `base_model=` instead seeds the fit from a shipped booster (`xgb_model=`), appending locally-trained trees — this is what `transfer-learning` uses. `model_in=` skips fitting entirely and scores frozen.
 - Writes `model.json` (booster), `vocab.json` (`{vocab, extras}`), and `preds.parquet`:
 
 ```         
@@ -172,30 +226,40 @@ Why split this way: for a continuous / per-window model each stay contributes ma
 ## 3. Output tree (three site-prefixed folders)
 
 `<site>` is the `site` field from the clif config (slugified). Only the non-PHI folder
-is meant to leave the site; models are what `train` ships to other sites.
+is meant to leave the site; models are what `local-training` ships to other sites.
+
+Artifacts that describe a **model** carry a `<kind>` segment; artifacts that describe
+the site's **data** do not, and are shared across all three kinds rather than
+duplicated. `<kind>` is one of `local`, `transfer`, `external_validation`.
 
 ```         
 <out>/
-  <site>_baseline_phi/<task_name>/            ← stays local (PHI)
-    cohort.parquet            # one row per prediction_id (+ split, label, demographics)
-    data/MEDS.parquet         # MEDS events: subject_id,time,code,numeric/text_value, hosp ids
-    preds.parquet             # prediction_id, …, split, label, y_prob, y_pred
+  <site>_baseline_phi/                        ← stays local (PHI)
+    _shared/MEDS/part-*.parquet   # ONE shared event store over the union of all cohorts
+    <task_name>/
+      cohort.parquet              # one row per prediction_id (+ split, label, demographics)
+      features.npz                # cached feature-join (+ features_meta.json sidecar)
+      preds_<kind>.parquet        # prediction_id, …, split, label, y_prob, y_pred
 
   <site>_baseline_non_phi_for_upload/<task_name>/   ← upload this
     codes.parquet             # code registry (description, version, counts<10 floored, value flags)
     table1.json               # cohort characteristics by split & label
-    report/
-      discrimination.json     # AUROC/AUPRC + ROC/PR curves + operating point (+CIs)
-      calibration.json        # reliability bins, ECE, Brier, slope/intercept  (episodic/landmark)
-      dca.json                # decision-curve net benefit                     (episodic/landmark)
-      fairness.json           # per-subgroup metrics + parity gaps
-      leadtime.json           # per-window sensitivity, median lead-time, risk trajectory (landmark)
+    report/<kind>/
+      overall.json            # headline discrimination/calibration/DCA/fairness (episodic)
+      landmark.json           # the same, per lead-time landmark + pooled       (continuous)
+      hospitalization_level.json
       viz/                    # only with --viz; PNGs rendered from the JSONs (local sanity)
 
-  <site>_baseline_models/<task_name>/         ← ship to other sites
-    model.json                # trained XGBoost booster
-    vocab.json                # {vocab:[…codes…], extras:["age_at_admission"]}
+  <site>_baseline_models/<task_name>/<kind>/  ← ship <kind>=local to other sites
+    model.json                # XGBoost booster (transfer: base trees + local trees)
+    vocab.json                # {vocab:[…codes…], roles:[…], features:[…], extras:[…]}
+    params.json               # the tuned hyperparameters that produced it
 ```
+
+A site holds one `report/<kind>/` per answer it computed. The source site (MIMIC)
+computes `local` only; an external site can compute all three and compare them on
+the same 25% holdout. Model bundles shipped before the `<kind>` split were flat
+(`<task>/model.json`) and are still resolved.
 
 Landmark tasks (1, 2) wrap each pillar as `{metadata, landmarks:[…]}` (one entry per
 lead-time) and add `leadtime.json`. A peak-mode task would omit `calibration.json`/`dca.json`.
@@ -259,14 +323,18 @@ lead-time) and add `leadtime.json`. A peak-mode task would omit `calibration.jso
 
 ### Results summary
 
+MIMIC-IV source run, 2026-07-27 — all four tasks, HPO on, 118 min total:
+
 | task                         | test AUROC | features | n_test (pos)      |
 |------------------------------|-----------:|---------:|-------------------|
-| icu_daily_mortality    |  **0.790** |      433 | 49,362 (9,838)    |
-| icu_daily_ltach        |  **0.757** |      433 | 49,362 (7,152)    |
-| extubation_failure_24h |  **0.701** |      412 | 6,694 (364)       |
-| icu_readmission        |  **0.645** |      429 | 16,814 (1,562)    |
+| icu_daily_mortality    |  **0.867** |      446 | 65,659 (13,169)   |
+| icu_daily_ltach        |  **0.724** |      446 | 65,659 (10,351)   |
+| extubation_failure_24h |  **0.714** |      446 | 5,254 (284)       |
+| icu_readmission        |  **0.670** |      446 | 13,256 (1,190)    |
 
-Excluding HOSP_DX moved AUROC by ≤ 0.02 vs the leaky version — the post-hoc diagnoses were not real predictive signal, just leakage (and they had ballooned the vocab, e.g. icu_daily_mortality 1,840 → 433).
+The two continuous tasks report the pair-weighted pooled cross-landmark aggregate; the two episodic tasks report `discrimination.auroc`. Feature width is now identical across tasks (442 code columns from 211 vocabulary codes + 4 dense extras) because the vocabulary is a fixed committed file rather than fit per task.
+
+Excluding HOSP_DX moved AUROC by ≤ 0.02 vs the leaky version — the post-hoc diagnoses were not real predictive signal, just leakage (and they had ballooned the vocab, e.g. icu_daily_mortality 1,840 → 433 under the old per-task vocabulary).
 
 ------------------------------------------------------------------------
 
@@ -343,12 +411,20 @@ threshold) — enough for a coordinator to align and pool sites.
 
 ------------------------------------------------------------------------
 
-## 10. External-site validation (`infer`)
+## 10. External-site validation
 
 ``` bash
 # copy a training site's models folder to this site, then:
-uv run flair-baseline infer --task extubation_failure_24h \
+uv run flair-baseline external-validation --task extubation_failure_24h \
   --models-dir mimic_baseline_models \
+  --clif-config config/clif_config.json --out . --viz
+
+# optional — the other two answers, on the same local holdout (needs a
+# full-cohort prepare, i.e. WITHOUT --holdout-only):
+uv run flair-baseline transfer-learning --task extubation_failure_24h \
+  --models-dir mimic_baseline_models \
+  --clif-config config/clif_config.json --out . --viz
+uv run flair-baseline local-training --task extubation_failure_24h \
   --clif-config config/clif_config.json --out . --viz
 ```
 

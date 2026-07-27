@@ -7,9 +7,12 @@
 # Small tasks first so quick wins bank before the slow landmark tasks (~1h/task with
 # HPO on; much faster with --no-hpo).
 #
-# Extra args are passed straight through to `flair-baseline train`, so:
+# Extra args are passed straight through to `flair-baseline local-training`, so:
 #   ./run_mimic_train.sh --no-hpo            # skip the Optuna sweep
 #   ./run_mimic_train.sh --task icu_readmission
+#
+# MIMIC is the source site: it produces the `local` kind only, and that bundle
+# (<site>_baseline_models/<task>/local/) is what ships to other sites.
 #
 # Per-task wall-clock timing -> mimic_train_<UTC date>.log
 set -u
@@ -37,7 +40,7 @@ for t in $TASKS; do
   fi
   echo "===== START $t $(date -u +%FT%TZ) =====" | tee -a "$LOG"
   s=$(date +%s)
-  uv run flair-baseline train --task "$t" \
+  uv run flair-baseline local-training --task "$t" \
     --clif-config "$CONFIG" --out . --viz "$@" >> "$LOG" 2>&1
   rc=$?
   e=$(date +%s)
