@@ -622,7 +622,7 @@ dependencies = [
     { name = "typer" },
 ]
 wheels = [
-    { filename = "flair_benchmark-0.0.1-py3-none-any.whl", hash = "sha256:fe2e79319c574d7842310471b0d56b0b75c093914df4c4c421837ceadcb29e8b" },
+    { filename = "flair_benchmark-0.0.1-py3-none-any.whl", hash = "sha256:033b4053efce65c0c4d8533509b8c9e4b2fda991b77c140a8f0a425796baf683" },
 ]
 
 [package.optional-dependencies]
