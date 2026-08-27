@@ -1,13 +1,13 @@
 # FLAIR Baseline
 
-Train the source XGBoost models on MIMIC, or evaluate them at an external CLIF site. Patient-level data stays at the site.
+Evaluate source XGBoost models at an external CLIF site, or train the source models on MIMIC. Patient-level data stays at the site.
 
 ## Choose A Workflow
 
 | Who | Goal | Data preparation | Commands after preparation |
 |---|---|---|---|
-| MIMIC model owner | Build the model bundle | Full cohort plus a new vocabulary | `local-training` via `run_mimic_train.sh` |
 | External site | Compare all three approaches | Full cohort | `external-validation`, `transfer-learning`, `local-training` |
+| MIMIC model owner | Build the model bundle | Full cohort plus a new vocabulary | `local-training` via `run_mimic_train.sh` |
 
 External sites must prepare the full cohort. Do not use `--holdout-only` because transfer learning and local training require the train split.
 
@@ -23,12 +23,43 @@ Create the config required by your role:
 
 | Role | Command | Required `site` value |
 |---|---|---|
-| MIMIC model owner | `cp config/clif_config.template.json config/clif_config_mimic.json` | `mimic` |
 | External CLIF site | `cp config/clif_config.template.json config/clif_config.json` | A short local site name |
+| MIMIC model owner | `cp config/clif_config.template.json config/clif_config_mimic.json` | `mimic` |
 
 Edit the copied file with the local CLIF data location. Config fields are listed in [Config Parameters](#config-parameters).
 
-## MIMIC Model Owner
+## External Sites
+
+Copy the published `mimic_baseline_models/` folder into the repository root. Prepare the full cohort once, then run all three model commands:
+
+```bash
+uv run flair-baseline prepare \
+  --clif-config config/clif_config.json \
+  --out . \
+  --reuse \
+  --pmc
+
+uv run flair-baseline external-validation \
+  --models-dir mimic_baseline_models \
+  --clif-config config/clif_config.json \
+  --out .
+
+uv run flair-baseline transfer-learning \
+  --models-dir mimic_baseline_models \
+  --clif-config config/clif_config.json \
+  --out . \
+  --hpo-trials 10
+
+uv run flair-baseline local-training \
+  --clif-config config/clif_config.json \
+  --out . \
+  --hpo-trials 10
+```
+
+The model commands are independent after `prepare`. The external-site training commands above limit HPO to 10 trials. Add `--no-hpo` to `transfer-learning` and `local-training` for a faster fixed-parameter run instead.
+
+<details>
+<summary><strong>MIMIC Model Owner</strong></summary>
 
 Build cohorts, create the shared data, generate the source vocabulary, featurize, and train all four models:
 
@@ -65,48 +96,22 @@ mimic_baseline_models/
 
 `model.json` and `vocab.json` are required by external sites. `params.json` is included for auditability.
 
-## External Sites
-
-Copy the published `mimic_baseline_models/` folder into the repository root. Prepare the full cohort once, then run all three model commands:
-
-```bash
-uv run flair-baseline prepare \
-  --clif-config config/clif_config.json \
-  --out . \
-  --reuse \
-  --pmc
-
-uv run flair-baseline external-validation \
-  --models-dir mimic_baseline_models \
-  --clif-config config/clif_config.json \
-  --out .
-
-uv run flair-baseline transfer-learning \
-  --models-dir mimic_baseline_models \
-  --clif-config config/clif_config.json \
-  --out .
-
-uv run flair-baseline local-training \
-  --clif-config config/clif_config.json \
-  --out .
-```
-
-The model commands are independent after `prepare`. Add `--no-hpo` to `transfer-learning` and `local-training` for a faster fixed-parameter run.
+</details>
 
 ## Workflow Parameters
 
 The recommended values for each workflow are:
 
-| Parameter | MIMIC owner | External sites |
+| Parameter | External sites | MIMIC owner |
 |---|---|---|
-| `--clif-config` | `config/clif_config_mimic.json` | `config/clif_config.json` |
+| `--clif-config` | `config/clif_config.json` | `config/clif_config_mimic.json` |
 | `--out` | `.` | `.` |
-| `--models-dir` | Not used | `mimic_baseline_models` for external validation and transfer learning |
+| `--models-dir` | `mimic_baseline_models` for external validation and transfer learning | Not used |
 | `--holdout-only` | No | No |
-| `--reuse` | Optional on `build-data` | Recommended |
-| `--pmc` | Optional on `build-data` | Recommended |
+| `--reuse` | Recommended | Optional on `build-data` |
+| `--pmc` | Recommended | Optional on `build-data` |
 | `--task` | Omit for all tasks | Omit for all tasks |
-| `--no-hpo` | Optional | Optional for transfer and local training |
+| `--no-hpo` | Optional for transfer and local training | Optional |
 
 ### Shared CLI Parameters
 
