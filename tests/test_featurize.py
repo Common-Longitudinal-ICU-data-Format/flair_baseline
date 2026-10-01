@@ -6,7 +6,8 @@ Locks the contract that replaced count-only featurization:
   * ROLE_COUNT (medications) emits an event count whose value ignores the dose, and
     "never given" is a genuine 0;
   * ROLE_ONEHOT (RESP device/mode) emits 0/1 presence, never a count;
-  * the point-in-time filter is strict — an event at or after prediction_dttm is
+  * the point-in-time filter follows the FLAIR leakage rule — inclusive: an event
+    exactly at feature_cutoff_dttm (default prediction_dttm) is used, one after it is
     invisible to every statistic.
 """
 from __future__ import annotations
@@ -158,3 +159,46 @@ def test_matrix_width_is_fixed_by_vocab_not_by_site_data():
         _COHORT.filter(pl.col("prediction_id") == "pB"), "label", vocab=vocab)
     assert X_all.shape[1] == expected
     assert X_one.shape[1] == expected
+
+
+def _boundary_cohort(**extra):
+    return pl.DataFrame({
+        "prediction_id": ["pA"], "hospitalization_join_id": ["A"],
+        "prediction_dttm": [datetime(2020, 1, 2)], "split": ["train"], "label": [1],
+        **extra,
+    })
+
+
+_BOUNDARY_EVENTS = pl.DataFrame({
+    "hospitalization_join_id": ["A", "A", "A"],
+    "time": [datetime(2020, 1, 1, 12),   # well before
+             datetime(2020, 1, 2),       # exactly at prediction_dttm
+             datetime(2020, 1, 2, 0, 0, 1)],  # one second after
+    "code": ["LAB//lactate//mmol/l"] * 3,
+    "numeric_value": [1.0, 3.0, 50.0],
+})
+
+
+def test_event_at_cutoff_is_included():
+    """FLAIR leakage rule is time <= cutoff: the boundary sample counts, +1s does not."""
+    X, ids, names = count_features(_BOUNDARY_EVENTS, _boundary_cohort(), "label")
+    col = {n: i for i, n in enumerate(names)}
+    assert X[0, col[f"{_LACTATE}::min"]] == np.float32(1.0)
+    assert X[0, col[f"{_LACTATE}::max"]] == np.float32(3.0)
+
+
+def test_feature_cutoff_dttm_overrides_prediction_dttm():
+    """An earlier feature_cutoff_dttm hides events between it and prediction_dttm."""
+    cohort = _boundary_cohort(feature_cutoff_dttm=[datetime(2020, 1, 1, 12)])
+    X, ids, names = count_features(_BOUNDARY_EVENTS, cohort, "label")
+    col = {n: i for i, n in enumerate(names)}
+    for s in STATS:
+        assert X[0, col[f"{_LACTATE}::{s}"]] == np.float32(1.0)
+
+
+def test_null_feature_cutoff_falls_back_to_prediction_dttm():
+    cohort = _boundary_cohort(
+        feature_cutoff_dttm=pl.Series([None], dtype=pl.Datetime("us")))
+    X, ids, names = count_features(_BOUNDARY_EVENTS, cohort, "label")
+    col = {n: i for i, n in enumerate(names)}
+    assert X[0, col[f"{_LACTATE}::max"]] == np.float32(3.0)

@@ -1,8 +1,9 @@
 """Leak-free point-in-time featurizer (integerized, block-chunked, role-aware).
 
 Every feature summarizes the events of one (level-truncated) code in the same encounter
-(``hospitalization_join_id``) with ``time < prediction_dttm`` — strict point-in-time, no
-leakage. *How* they are summarized depends on the code's **role**:
+(``hospitalization_join_id``) with ``time <= feature_cutoff_dttm`` (falling back to
+``prediction_dttm``) — the FLAIR leakage rule: inclusive at the cutoff, nothing after.
+*How* they are summarized depends on the code's **role**:
 
 * ``ROLE_STAT``   → four columns ``code::min|max|mean|median`` over ``numeric_value``.
   Labs, vitals, GCS/RASS, and the respiratory-support parameters. Never measured ⇒
@@ -78,7 +79,11 @@ ONEHOT_PREFIXES = ("RESP//device_category//", "RESP//mode_category//")
 # stores; load_counts refuses a mismatch rather than silently reading a stale shape.
 #   1 — count-only COO triplet
 #   2 — + per-role statistics block (srr/scc/svals) and role_by_cint
-CACHE_FORMAT = 2
+#   3 — inclusive cutoff (time <= feature_cutoff_dttm); v2 caches used strict <
+CACHE_FORMAT = 3
+
+# FLAIR cohort column holding the last instant whose data may be used.
+CUTOFF_COL = "feature_cutoff_dttm"
 
 
 def code_role(trunc: str) -> int:
@@ -192,9 +197,15 @@ def compute_counts(events, task_df: pl.DataFrame, n_chunks: int = 8,
     """
     ev = events if isinstance(events, pl.LazyFrame) else events.lazy()
 
+    # FLAIR carries the no-data-after instant as feature_cutoff_dttm (equal to
+    # prediction_dttm for every shipped task); a null or absent value falls back to
+    # prediction_dttm, mirroring flair_benchmark.features._scope.
+    cutoff = (pl.coalesce([pl.col(CUTOFF_COL), pl.col("prediction_dttm")])
+              if CUTOFF_COL in task_df.columns else pl.col("prediction_dttm"))
     preds = (
         task_df.select("prediction_id", JOIN_ID,
-                       pl.col("prediction_dttm").cast(pl.Datetime("us")), "split")
+                       pl.col("prediction_dttm").cast(pl.Datetime("us")),
+                       cutoff.cast(pl.Datetime("us")).alias("cutoff_dttm"), "split")
         .with_row_index("r")
     )
     prediction_ids = preds["prediction_id"].to_list()
@@ -237,9 +248,10 @@ def compute_counts(events, task_df: pl.DataFrame, n_chunks: int = 8,
     ev_mat = ev_int.collect(engine="streaming")
 
     preds_int = (
-        preds.select("r", JOIN_ID, "prediction_dttm")
+        preds.select("r", JOIN_ID, "prediction_dttm", "cutoff_dttm")
         .join(blocks, on=JOIN_ID)
-        .select(pl.col("r").cast(pl.UInt32), "jint", "chunk", "prediction_dttm")
+        .select(pl.col("r").cast(pl.UInt32), "jint", "chunk", "prediction_dttm",
+                "cutoff_dttm")
     )
 
     # Aggregate one block-hash partition at a time → bounded peak memory.
@@ -251,7 +263,7 @@ def compute_counts(events, task_df: pl.DataFrame, n_chunks: int = 8,
         longk = (
             ev_mat.lazy().filter(pl.col("chunk") == k)
             .join(preds_int.lazy().filter(pl.col("chunk") == k), on="jint", how="inner")
-            .filter(pl.col("time") < pl.col("prediction_dttm"))   # strict point-in-time
+            .filter(pl.col("time") <= pl.col("cutoff_dttm"))   # inclusive, FLAIR leakage rule
             .select("r", "cint", "numeric_value", "is_stat")
             .collect(engine="streaming")
         )
