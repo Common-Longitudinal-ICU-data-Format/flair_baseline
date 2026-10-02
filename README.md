@@ -2,6 +2,8 @@
 
 Evaluate source XGBoost models at an external CLIF site, or train the source models on MIMIC. Patient-level data stays at the site.
 
+![FLAIR Baseline workflow](assets/FlairBaselineWorkflow.gif)
+
 ## Choose A Workflow
 
 | Who | Goal | Data preparation | Commands after preparation |
