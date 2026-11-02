@@ -54,6 +54,18 @@ def test_per_data_artifacts_have_no_kind(tmp_path):
         assert not any(k in path.parts for k in KINDS), path
 
 
+def test_outputs_live_in_flairs_folders(tmp_path):
+    """FLAIR's load-task owns the PHI / non-PHI roots; baseline writes inside them."""
+    from flair_baseline.layout import SitePaths
+    p = TaskPaths.make(tmp_path, "Site B", TASK)
+    assert p.cohort == tmp_path / "site_b_flair_phi" / TASK / "cohort.parquet"
+    assert p.table1 == tmp_path / "site_b_flair_non_phi_for_upload" / TASK / "table1.json"
+    assert p.model(KIND_LOCAL).parts[-4] == "site_b_baseline_models"
+    sp = SitePaths.make(tmp_path, "Site B")
+    assert sp.meds_dir == tmp_path / "site_b_flair_phi" / "_shared" / "MEDS"
+    assert sp.snapshot.name.startswith("site_b_flair_v")
+
+
 def test_unknown_kind_is_rejected(tmp_path):
     p = TaskPaths.make(tmp_path, "siteb", TASK)
     with pytest.raises(ValueError, match="unknown model kind"):

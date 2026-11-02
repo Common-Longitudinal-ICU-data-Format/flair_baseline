@@ -5,48 +5,54 @@ benchmark change lands here only when someone rebuilds it. These tests are the
 tripwire for that moment: they fail in seconds on the next incompatible rebuild
 instead of hours into a MIMIC run.
 
-Both cases are regressions we actually hit when the benchmark was reorganized
-into pipeline-stage packages:
+Regressions we actually hit:
 
-  * ``report_mode`` used to come from a ``TASK_POLICY`` dict that was deleted, and
-    returned modes (``landmark``/``peak``) that ``build_report`` now rejects
-    outright with a ValueError.
   * the report bundle consolidated (schema 3 -> 4) and ``discrimination.json``
     stopped existing, so the headline-AUROC reader silently returned None.
+  * the baseline drifted from FLAIR's CLI and clif config (extra config keys,
+    dropped kwargs). It now shells out to `flair`, so the commands it calls and
+    the config `flair init-config` writes are pinned here.
 """
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 from flair_baseline.cli import _headline_json, _report_auroc
-from flair_baseline.layout import report_mode
 
-from flair_baseline.config import available_tasks
-from flair_benchmark.constants import REPORT_MODES
+FLAIR = str(Path(sys.executable).parent / "flair")
 
 
 # --------------------------------------------------------------------------- #
-# report_mode must stay inside the benchmark's accepted vocabulary
+# the FLAIR CLI surface the baseline shells out to
 # --------------------------------------------------------------------------- #
-def test_every_task_reports_a_mode_the_benchmark_accepts():
-    """``report_mode`` feeds straight into ``build_report(mode=...)``.
-
-    ``report._resolve_mode`` raises on anything outside REPORT_MODES, so a task
-    whose META drifts out of that set would crash at report time — after the full
-    ETL, featurization and model fit have already been paid for.
-    """
-    tasks = available_tasks()
-    assert tasks, "no tasks discovered — the benchmark task registry is empty"
-    for t in tasks:
-        assert report_mode(t) in REPORT_MODES, (
-            f"task {t!r} reports mode {report_mode(t)!r}, which build_report "
-            f"rejects; accepted: {sorted(REPORT_MODES)}")
+def test_flair_cli_has_the_commands_the_baseline_calls():
+    out = subprocess.run([FLAIR, "--help"], capture_output=True, text=True,
+                         check=True).stdout
+    for cmd in ("load-task", "build-report", "init-config"):
+        assert cmd in out, f"`flair {cmd}` missing — cli._flair calls it"
 
 
-def test_report_mode_falls_back_for_an_unknown_task():
-    """An unresolvable task name must not raise — layout owns the fallback."""
-    assert report_mode("no_such_task_exists") in REPORT_MODES
+@pytest.mark.parametrize("cmd,flags", [
+    ("load-task", ("--clif-config", "--out", "--snapshot")),
+    ("build-report", ("--task", "--cohort", "--out")),
+])
+def test_flair_cli_flags_the_baseline_passes(cmd, flags):
+    out = subprocess.run([FLAIR, cmd, "--help"], capture_output=True, text=True,
+                         check=True).stdout
+    for f in flags:
+        assert f in out, f"`flair {cmd}` no longer accepts {f}"
+
+
+def test_init_config_template_is_readable(tmp_path):
+    """The default --clif-config is whatever `flair init-config` writes."""
+    from flair_benchmark.cohort.clif import read_clif_config
+    subprocess.run([FLAIR, "init-config", "--out", str(tmp_path)], check=True,
+                   capture_output=True)
+    assert read_clif_config(str(tmp_path / "clif_config.json"))["site"]
 
 
 # --------------------------------------------------------------------------- #
@@ -106,16 +112,13 @@ def test_report_auroc_does_not_read_the_deleted_discrimination_json(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# a plotting failure must not discard a finished run
+# mode detection and the AUROC reader share one filename map
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("mode,filename", [("episodic", "overall.json"),
                                            ("continuous", "landmark.json")])
 def test_headline_json_matches_the_auroc_reader(tmp_path, mode, filename):
-    """The viz-tolerance check and the AUROC reader must agree on the filename.
-
-    If they drift, a viz failure either aborts a good run or masks a genuinely
-    missing report.
-    """
+    """_report detects the mode from the file FLAIR wrote; the AUROC reader must
+    agree on that filename or the headline silently reads None."""
     assert _headline_json(tmp_path, mode).name == filename
     (tmp_path / filename).write_text(json.dumps(
         {"discrimination": {"auroc": 0.5}, "pooled": {"auroc": 0.5}}))

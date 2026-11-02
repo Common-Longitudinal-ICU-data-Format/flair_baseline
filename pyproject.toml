@@ -5,9 +5,9 @@ description = "XGBoost point-in-time feature baseline for FLAIR ICU benchmark ta
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    # [viz] pulls matplotlib. build_report(viz=True) swallows a matplotlib
-    # ImportError, so without the extra `--viz` silently renders nothing.
-    "flair-benchmark[viz]",
+    # matplotlib is a core dep of flair-benchmark; `flair build-report` always
+    # renders viz/.
+    "flair-benchmark",
     "xgboost>=2.0",
     "optuna>=3.0",
     "tqdm>=4",
@@ -19,7 +19,7 @@ dependencies = [
     "scipy>=1.10",
     "typer>=0.12",
     "pyyaml>=6.0",
-    "clifpy>=0.4.9",
+    "clifpy>=2.1.0",
 ]
 
 [project.scripts]

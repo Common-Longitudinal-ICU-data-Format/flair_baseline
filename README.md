@@ -2,6 +2,8 @@
 
 Evaluate source XGBoost models at an external CLIF site, or train the source models on MIMIC. Patient-level data stays at the site.
 
+The baseline runs on top of the [FLAIR](../FLAIR) CLI. Cohorts, Table 1, STROBE and the snapshot come from `flair load-task`, reports come from `flair build-report`, and the config comes from `flair init-config`. FLAIR also creates the output folders. The baseline adds the shared CLIF→MEDS pull, featurization, the XGBoost models and the three model kinds.
+
 ![FLAIR Baseline workflow](assets/FlairBaselineWorkflow.gif)
 
 ## Choose A Workflow
@@ -25,10 +27,10 @@ Create the config required by your role:
 
 | Role | Command | Required `site` value |
 |---|---|---|
-| External CLIF site | `cp config/clif_config.template.json config/clif_config.json` | A short local site name |
-| MIMIC model owner | `cp config/clif_config.template.json config/clif_config_mimic.json` | `mimic` |
+| External CLIF site | `uv run flair init-config --out config` | A short local site name |
+| MIMIC model owner | `uv run flair init-config --out config && mv config/clif_config.json config/clif_config_mimic.json` | `mimic` |
 
-Edit the copied file with the local CLIF data location. Config fields are listed in [Config Parameters](#config-parameters).
+Edit the generated file and set `site`, `data_directory` and `timezone`. Config fields are listed in [Config Parameters](#config-parameters).
 
 ## External Sites
 
@@ -38,7 +40,6 @@ Copy the published `mimic_baseline_models/` folder into the repository root. Pre
 uv run flair-baseline prepare \
   --clif-config config/clif_config.json \
   --out . \
-  --reuse \
   --pmc
 
 uv run flair-baseline external-validation \
@@ -57,6 +58,8 @@ uv run flair-baseline local-training \
   --out . \
   --hpo-trials 10
 ```
+
+`prepare` runs `flair load-task` for every task and creates a new FLAIR snapshot (`<site>_flair_v<version>/`). Snapshots are optional. On later runs, pass `--snapshot <site>_flair_v<version>` to `prepare`, `build-cohorts` or `build-data` to reuse the frozen encounter IDs. Without it, FLAIR replaces the snapshot.
 
 The model commands are independent after `prepare`. The external-site training commands above limit HPO to 10 trials. Add `--no-hpo` to `transfer-learning` and `local-training` for a faster fixed-parameter run instead.
 
@@ -110,7 +113,6 @@ The recommended values for each workflow are:
 | `--out` | `.` | `.` |
 | `--models-dir` | `mimic_baseline_models` for external validation and transfer learning | Not used |
 | `--holdout-only` | No | No |
-| `--reuse` | Recommended | Optional on `build-data` |
 | `--pmc` | Recommended | Optional on `build-data` |
 | `--task` | Omit for all tasks | Omit for all tasks |
 | `--no-hpo` | Optional for transfer and local training | Optional |
@@ -119,7 +121,7 @@ The recommended values for each workflow are:
 
 | Parameter | Default | Commands | Meaning |
 |---|---|---|---|
-| `--clif-config PATH` | `config/clif_config.template.json` | All | CLIF site config file |
+| `--clif-config PATH` | `config/clif_config.json` | All | CLIF site config file (`flair init-config`) |
 | `--out PATH` | `.` | All | Root directory for site-prefixed outputs |
 | `--task NAME` | All tasks | All except `build-vocab` | Run one exact task name or unique task prefix |
 
@@ -128,18 +130,17 @@ The recommended values for each workflow are:
 | Parameter | Default | Commands | Meaning |
 |---|---|---|---|
 | `--elf-config PATH` | `flair_elf_config.yaml` | `prepare`, `build-data` | ELF domain configuration |
-| `--train-end YYYY-MM-DD` | Unset | `prepare`, `build-cohorts` | Last date assigned to train; use with `--test-start` |
-| `--test-start YYYY-MM-DD` | Unset | `prepare`, `build-cohorts` | First date assigned to test; use with `--train-end` |
+| `--snapshot PATH` | Unset (new snapshot) | `prepare`, `build-cohorts`, `build-data` | Reuse an earlier FLAIR snapshot's frozen encounter IDs; passed to `flair load-task` |
 | `--holdout-only` | Off | `prepare`, `build-data`, `featurize` | Process only test rows; not used by the required external-site workflow |
 | `--full-cohort` | On | `prepare`, `build-data`, `featurize` | Process train and test rows |
-| `--reuse` | Off | `prepare`, `build-data` | Reuse shared MEDS data when its manifest matches |
-| `--no-reuse` | On | `prepare`, `build-data` | Rebuild shared MEDS data |
 | `--pmc` | Off | `prepare`, `build-data` | Batch ETL to reduce peak memory |
 | `--no-pmc` | On | `prepare`, `build-data` | Run ETL without batching |
 | `--batch-size N` | `4000` | `prepare`, `build-data` | Encounters per batch when `--pmc` is enabled |
 | `--vocab-out PATH` | `vocab.json` | `build-vocab` | Destination for the generated source vocabulary |
 
-If both split dates are omitted, MIMIC uses a deterministic patient-level 75/25 split and external sites use an oldest/newest patient-level 75/25 split. Supply both date parameters when using explicit dates.
+If `build-data` fails with `InvalidInputException: Attempting to execute an unsuccessful or closed pending query result`, set FLAIR's `FLAIR_MEDS_WORKERS=1` to make the MEDS extraction run serially. For example: `FLAIR_MEDS_WORKERS=1 uv run flair-baseline prepare ...`. The error comes from clifpy, which shares one DuckDB connection across FLAIR's parallel domain workers.
+
+FLAIR assigns the split: a deterministic 75/25 split for MIMIC, and a temporal 75/25 split (oldest/newest) by stitched encounter for every other site.
 
 ### Model Parameters
 
@@ -147,8 +148,7 @@ If both split dates are omitted, MIMIC uses a deterministic patient-level 75/25 
 |---|---|---|---|
 | `--models-dir PATH` | Required | `external-validation`, `transfer-learning` | Published source model bundle |
 | `--vocab PATH` | `vocab.json` | `local-training` | Fixed vocabulary used for a new local model |
-| `--report` / `--no-report` | Report on | All model commands | Enable or disable report JSON generation |
-| `--viz` / `--no-viz` | Visualizations on | All model commands | Enable or disable report PNG generation |
+| `--report` / `--no-report` | Report on | All model commands | Run `flair build-report` (JSON + `viz/` PNGs) |
 | `--hpo` / `--no-hpo` | HPO on | `local-training`, `transfer-learning` | Enable Optuna search or use fixed parameters |
 | `--hpo-trials N` | `30` | `local-training`, `transfer-learning` | HPO trial budget |
 
@@ -170,9 +170,9 @@ Use one of these values with `--task`. Add the same `--task` value to `prepare` 
 | `site` | Yes | None | Site label used in output folder names; use `mimic` for the source site |
 | `data_directory` | Yes | None | Directory containing local `clif_*` files |
 | `filetype` | Yes | None | `parquet` or `csv` |
-| `timezone` | No | `US/Central` | Timezone used for CLIF datetimes |
-| `stitch_time_interval_hours` | No | `6` | Maximum gap used for encounter stitching |
-| `cache_directory` | No | `./output` in the template | Local CLIF cache directory; if omitted, uses `<data_directory>/_flair_cache` |
+| `timezone` | Yes | None | Site IANA timezone, e.g. `US/Eastern` |
+
+These are FLAIR's own config keys (see the FLAIR README). FLAIR fixes the stitching gap at 6 hours and rejects the old `stitch_time_interval_hours` and `cache_directory` keys.
 
 The default workflow expects these CLIF tables:
 
@@ -189,17 +189,18 @@ Files are normally named `clif_<table>.parquet` or `clif_<table>.csv`. `hospital
 Share both generated folders:
 
 ```text
-<site>_baseline_non_phi_for_upload/
+<site>_flair_non_phi_for_upload/
 <site>_baseline_models/
 ```
 
-The non-PHI folder contains `codes.parquet`, `table1.json`, and one `report/<kind>/` directory for each model command. The models folder contains the generated local and transfer-learning models.
+The non-PHI folder holds, per task, FLAIR's `table1.json` and STROBE PNGs, the baseline's `codes.parquet`, and one `report/<kind>/` directory per model command. The models folder contains the generated local and transfer-learning models.
 
 Do not upload:
 
 ```text
-<site>_baseline_phi/
+<site>_flair_phi/
+<site>_flair_v<version>/
 mimic_baseline_models/
 ```
 
-The PHI folder contains cohorts, features, MEDS events, and predictions and must remain at the site.
+The PHI folder contains cohorts, features, MEDS events and predictions. The snapshot holds encounter IDs. Both must remain at the site.

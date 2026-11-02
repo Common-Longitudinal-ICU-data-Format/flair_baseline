@@ -23,8 +23,8 @@ cd "$(dirname "$0")" || exit 1
 
 CONFIG=config/clif_config_mimic.json
 if [ ! -f "$CONFIG" ]; then
-  echo "missing $CONFIG — copy config/clif_config.template.json and set your" >&2
-  echo "site name + MIMIC data_directory (see README)." >&2
+  echo "missing $CONFIG — run \`uv run flair init-config --out config\`, rename it" >&2
+  echo "to clif_config_mimic.json and set site \"mimic\" + data_directory (see README)." >&2
   exit 1
 fi
 
@@ -41,7 +41,7 @@ for t in $TASKS; do
   echo "===== START $t $(date -u +%FT%TZ) =====" | tee -a "$LOG"
   s=$(date +%s)
   uv run flair-baseline local-training --task "$t" \
-    --clif-config "$CONFIG" --out . --viz "$@" >> "$LOG" 2>&1
+    --clif-config "$CONFIG" --out . "$@" >> "$LOG" 2>&1
   rc=$?
   e=$(date +%s)
   echo "===== END   $t rc=$rc elapsed=$((e-s))s ($(( (e-s)/60 ))m$(( (e-s)%60 ))s) =====" | tee -a "$LOG"

@@ -3,8 +3,9 @@
 !wheels/*.whl
 
 # site-prefixed run outputs (PHI stays local; non-PHI is uploaded out-of-band)
-*_baseline_phi/
-*_baseline_non_phi_for_upload/
+*_flair_phi/
+*_flair_non_phi_for_upload/
+*_flair_v*/
 *_baseline_models/
 
 # legacy / scratch output roots + clifpy caches and logs
@@ -17,9 +18,8 @@ logs/
 .mimic_run_stamps/
 *.log
 
-# real site configs — only the .template.json is tracked
+# real site configs — scaffold one with `flair init-config --out config`
 clif_config*.json
-!clif_config*.template.json
 
 # python / uv
 .venv/

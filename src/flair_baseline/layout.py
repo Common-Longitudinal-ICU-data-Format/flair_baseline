@@ -1,11 +1,15 @@
 """Site-prefixed, sensitivity-partitioned output layout.
 
-Every run writes into three sibling folders under one ``--out`` root, each
-prefixed with the site name (from the clif config ``site`` field):
+FLAIR owns the folders: `flair load-task` creates the PHI / non-PHI roots and the
+snapshot under one ``--out`` root, each prefixed with the site name (from the
+clif config ``site`` field). The baseline writes its own artifacts inside them:
 
-  <site>_baseline_phi/<task>/                 cohort.parquet, MEDS.parquet, preds_<kind>.parquet
-  <site>_baseline_non_phi_for_upload/<task>/  codes.parquet, table1.json, report/<kind>/…
-  <site>_baseline_models/<task>/<kind>/       model.json, vocab.json, params.json
+  <site>_flair_v<version>/                 FLAIR snapshot (encounter_index.parquet, hashes.json)
+  <site>_flair_phi/_shared/MEDS/            shared events (baseline)
+  <site>_flair_phi/<task>/                  cohort.parquet (FLAIR); features.npz, preds_<kind>.parquet
+  <site>_flair_non_phi_for_upload/<task>/   table1.json + strobe PNGs (FLAIR); codes.parquet,
+                                            report/<kind>/… (`flair build-report`)
+  <site>_baseline_models/<task>/<kind>/     model.json, vocab.json, params.json
 
 Only the non-PHI folder is meant to leave the site. Models are what
 `local-training` ships to other sites; `external-validation` and
@@ -23,11 +27,11 @@ writes identically.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from flair_benchmark.tasks import get_task
+from flair_benchmark.cohort.clif import site_slug
+from flair_benchmark.cohort.stitch import snapshot_name
 
 # --------------------------------------------------------------------------- #
 # model kinds — the one axis that separates a site's three answers
@@ -50,22 +54,9 @@ def check_kind(kind: str) -> str:
     return kind
 
 
-def report_mode(task_name: str) -> str:
-    """Report mode for a task — read from the task module's own ``META``.
-
-    Continuous tasks report per lead-time; episode tasks report episodic.
-    An unknown task (``get_task`` raises) defaults to episodic. The lookup stays
-    generic, so a task whose META names another mode still routes correctly.
-    """
-    try:
-        return get_task(task_name).META.get("report_mode", "episodic")
-    except (ValueError, TypeError):
-        return "episodic"
-
-
 def slug(site: str | None) -> str:
     """Folder-safe site token. Raises when empty so folders are never un-prefixed."""
-    s = re.sub(r"[^a-z0-9]+", "_", (site or "").strip().lower()).strip("_")
+    s = site_slug(site or "")
     if not s:
         raise ValueError(
             "clif config has no usable 'site' name; set \"site\" in the config "
@@ -93,7 +84,12 @@ class SitePaths:
 
     @property
     def shared_root(self) -> Path:
-        return self.out_root / f"{self.site}_baseline_phi" / "_shared"
+        return self.out_root / f"{self.site}_flair_phi" / "_shared"
+
+    @property
+    def snapshot(self) -> Path:
+        """Where `flair load-task` (no --snapshot) leaves its encounter index."""
+        return self.out_root / snapshot_name(self.site)
 
     @property
     def meds_dir(self) -> Path:
@@ -108,11 +104,6 @@ class SitePaths:
     def versions(self) -> Path:
         """Per-domain ELF versions captured at build-data time (for the codes registry)."""
         return self.shared_root / "domain_versions.json"
-
-    @property
-    def manifest(self) -> Path:
-        """Reuse key for build-data: scope + join-id-set hash + elf hash + batch info."""
-        return self.shared_root / "manifest.json"
 
     def has_meds(self) -> bool:
         return self.meds_dir.exists() and any(self.meds_dir.glob("part-*.parquet"))
@@ -136,11 +127,11 @@ class TaskPaths:
     # --- roots (site-prefixed) ---------------------------------------------
     @property
     def phi_root(self) -> Path:
-        return self.out_root / f"{self.site}_baseline_phi" / self.task
+        return self.out_root / f"{self.site}_flair_phi" / self.task
 
     @property
     def nonphi_root(self) -> Path:
-        return self.out_root / f"{self.site}_baseline_non_phi_for_upload" / self.task
+        return self.out_root / f"{self.site}_flair_non_phi_for_upload" / self.task
 
     @property
     def models_root(self) -> Path:
@@ -150,10 +141,6 @@ class TaskPaths:
     @property
     def cohort(self) -> Path:
         return self.phi_root / "cohort.parquet"
-
-    @property
-    def meds(self) -> Path:
-        return self.phi_root / "data" / "MEDS.parquet"
 
     def preds(self, kind: str) -> Path:
         """Per-kind predictions. Without the suffix the second pipeline to run at
@@ -195,7 +182,7 @@ class TaskPaths:
     def mkdirs(self, kind: str | None = None) -> None:
         """Create every kind-independent directory this task writes into, plus
         the per-kind report/model dirs when a kind is given."""
-        dirs = [self.meds.parent, self.phi_root, self.codes.parent]
+        dirs = [self.phi_root, self.codes.parent]
         if kind is not None:
             dirs += [self.report_dir(kind), self.model_dir(kind)]
         for p in dirs:
